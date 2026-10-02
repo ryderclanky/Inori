@@ -19,6 +19,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "libs/hmd2.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
@@ -534,13 +535,15 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 
-	// Headset flips: buffers are GPU image descriptors the presenter cannot read, and there is
-	// no panel. Complete as blank so the title does not stall waiting for the flip.
-	if (handle == VideoOutDriver::Impl::VIDEO_OUT_VR_HANDLE) {
+	Common::LockGuard lock(video_out->mutex);
+	// Unregistered headset flips are GPU image descriptors the presenter cannot read. Complete
+	// those as blank so the title does not stall. Registered scanout buffers are real surfaces
+	// and are presented (and, without --vr, mirrored onto the desktop window).
+	if (handle == VideoOutDriver::Impl::VIDEO_OUT_VR_HANDLE &&
+	    (IsSpecialBufferIndex(index) || !video_out->buffers[index].Occupied())) {
 		index = VIDEO_OUT_BUFFER_INDEX_BLANK;
 	}
 
-	Common::LockGuard lock(video_out->mutex);
 	if ((video_out->master != nullptr) != (flip_mode == VIDEO_OUT_FLIP_MODE_SLAVE) ||
 	    (video_out->slave_count != 0) != (flip_mode == VIDEO_OUT_FLIP_MODE_MASTER)) {
 		return VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
@@ -620,6 +623,60 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 		EXIT("unsupported normalized video-out format\n");
 	}
 	return info;
+}
+
+static bool FlatVideoOutFormat(uint32_t guest, Graphics::VideoOutPixelFormatInfo& info) {
+	using Format = Graphics::Prospero::BufferFormat;
+	switch (static_cast<Format>(guest)) {
+		case Format::k10_10_10_2UNorm:
+			info = {vk::Format::eA2B10G10R10UnormPack32, Format::k10_10_10_2UNorm, 4, false};
+			return true;
+		case Format::k8_8_8_8Srgb:
+			info = {vk::Format::eR8G8B8A8Srgb, Format::k8_8_8_8Srgb, 4, false};
+			return true;
+		case Format::k8_8_8_8UNorm:
+			info = {vk::Format::eR8G8B8A8Unorm, Format::k8_8_8_8UNorm, 4, false};
+			return true;
+		case Format::k16_16_16_16Float:
+			info = {vk::Format::eR16G16B16A16Sfloat, Format::k16_16_16_16Float, 8, false};
+			return true;
+		default: return false;
+	}
+}
+
+static bool ImageInfoForFlatSource(const Hmd2::FlatPresentSource& src, Graphics::ImageInfo& info) {
+	Graphics::VideoOutPixelFormatInfo pixel {};
+	if (!FlatVideoOutFormat(src.guest_format, pixel) || src.address == 0 || src.width == 0 ||
+	    src.height == 0 || src.width > 16384 || src.height > 16384) {
+		return false;
+	}
+	const auto tile = static_cast<Graphics::Prospero::TileMode>(src.tile_mode);
+	const auto pitch = Graphics::TileGetTexturePitch(pixel.guest_format, src.width, tile);
+	Graphics::TileSizeAlign total {};
+	Graphics::TileGetTextureTotalSize(pixel.guest_format, src.width, src.height, 1, 1, tile, false,
+	                                  total);
+	if (pitch == 0 || total.size == 0 || total.align == 0 ||
+	    (src.address & (total.align - 1u)) != 0) {
+		return false;
+	}
+	info                 = {};
+	info.data            = {src.address, total.size};
+	info.pixel_format    = pixel.format;
+	info.guest_format    = pixel.guest_format;
+	info.type            = Graphics::Prospero::ImageType::kColor2D;
+	info.extent          = {src.width, src.height, 1};
+	info.resources       = {1, 1};
+	info.pitch           = pitch;
+	info.bytes_per_block = pixel.bytes_per_element;
+	info.samples         = 1;
+	info.tile_mode       = tile;
+	info.bgra16          = pixel.bgra16;
+	info.mip_layout[0]   = {0, total.size, pitch, src.height};
+	if (!Graphics::IsSupportedVideoOutFormat(info)) {
+		return false;
+	}
+	Graphics::ImageOps::Validate(info);
+	return true;
 }
 
 VideoOutDriver::VideoOutDriver(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
@@ -1129,6 +1186,34 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
+	// Desktop has no headset panel. A mis-sized flip of the reprojection buffer is
+	// rebuilt at the real size. A parsed eye replaces only the smaller main/social
+	// buffer; a registered VR scanout is left alone and mirrored in Flip. --vr is unchanged.
+	if (!special && !Config::VrEnabled()) {
+		Hmd2::FlatPresentSource flat {};
+		if (Hmd2::CopyFlatPresentSource(flat)) {
+			const bool address_match = source_info.data.address == flat.address &&
+			                           (source_info.extent.width != flat.width ||
+			                            source_info.extent.height != flat.height);
+			const bool promote       = flat.from_render_config &&
+			                     cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN &&
+			                     (source_info.extent.width < flat.width ||
+			                      source_info.extent.height < flat.height);
+			if (address_match || promote) {
+				Graphics::ImageInfo replacement {};
+				if (ImageInfoForFlatSource(flat, replacement)) {
+					static std::atomic_bool logged {false};
+					if (!logged.exchange(true, std::memory_order_relaxed)) {
+						LOGF("Hmd2 flat present: blit %" PRIu32 "x%" PRIu32 " fmt=%" PRIu32
+						     " from 0x%016" PRIx64 " over %ux%u\n",
+						     flat.width, flat.height, flat.guest_format, flat.address,
+						     source_info.extent.width, source_info.extent.height);
+					}
+					source_info = replacement;
+				}
+			}
+		}
+	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
@@ -1252,6 +1337,16 @@ bool FlipQueue::Flip(uint32_t micros) {
 	std::sort(requests.begin(), requests.begin() + count,
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
 	bool due = true;
+	bool mirror_headset = false;
+	if (!Config::VrEnabled()) {
+		for (size_t i = 0; i < count; i++) {
+			if (requests[i].cfg->bus == VIDEO_OUT_BUS_TYPE_VR &&
+			    !IsSpecialBufferIndex(requests[i].index)) {
+				mirror_headset = true;
+				break;
+			}
+		}
+	}
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
 	for (size_t i = 0; i < count; i++) {
 		auto& r = requests[i];
@@ -1260,7 +1355,13 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
 		}
-		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
+		int bus = r.cfg->bus;
+		if (mirror_headset && bus == VIDEO_OUT_BUS_TYPE_VR) {
+			bus = VIDEO_OUT_BUS_TYPE_MAIN;
+		} else if (mirror_headset && bus == VIDEO_OUT_BUS_TYPE_MAIN) {
+			bus = -1;
+		}
+		layers[i] = {r.frame, bus, r.premultiplied_alpha};
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
@@ -1889,13 +1990,13 @@ static int ValidateOutputConfig(int handle, uint64_t mode, const VideoOutOutputO
 		}
 	}
 
-	// VR bit is OR-ed onto a base mode. Port always opens (titles treat Open errors as handles),
-	// so --vr gates Configure/IsOutputSupported: refuse VR modes when VR is off so flat titles
-	// can give up on the headset path.
+	// VR bit is OR-ed onto a base mode. Port always opens (titles treat Open errors as handles).
+	// --vr or an initialized Hmd2 virtual headset may drive the port. Titles that never call
+	// sceHmd2Initialize are still refused so they can stay on the flat path.
 	const bool     vr        = ((mode & VIDEO_OUT_OUTPUT_MODE_VR) != 0);
 	const uint64_t base_mode = (mode & ~VIDEO_OUT_OUTPUT_MODE_VR);
 
-	if (vr && !Config::VrEnabled()) {
+	if (vr && !Config::VrEnabled() && !Hmd2::HeadsetInitialized()) {
 		return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
 	}
 
