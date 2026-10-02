@@ -613,9 +613,24 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	Graphics::TileSizeAlign total {};
 	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
 	                                  1, 1, tile_mode, false, total);
-	if (total.size == 0 || total.align != 65536 ||
-	    (buffer.data_address & (total.align - 1u)) != 0) {
-		EXIT("invalid video-out surface footprint or alignment\n");
+	// TV scanout allocations are 64 KiB aligned. An Hmd2 category-16 surface is an Agc color
+	// target: its base is often only 256-byte aligned, which still detiles from that address.
+	const bool scanout_aligned =
+	    total.align == 65536 &&
+	    (buffer.data_address & (static_cast<uint64_t>(total.align) - 1u)) == 0;
+	if (total.size == 0 || pitch == 0 || total.align == 0 || (!headset && !scanout_aligned)) {
+		EXIT("invalid video-out surface footprint or alignment size=%" PRIu32 " align=%" PRIu32
+		     " pitch=%" PRIu32 " address=0x%016" PRIx64 "\n",
+		     total.size, total.align, pitch, buffer.data_address);
+	}
+	if (headset) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("VideoOut: headset surface footprint %" PRIu32 "x%" PRIu32 " size=%" PRIu32
+			     " align=%" PRIu32 " pitch=%" PRIu32 " address=0x%016" PRIx64 "\n",
+			     attribute.width, attribute.height, total.size, total.align, pitch,
+			     buffer.data_address);
+		}
 	}
 	Graphics::ImageInfo info {};
 	info.data            = {buffer.data_address, total.size};
@@ -678,8 +693,9 @@ static bool ImageInfoForFlatSource(const Hmd2::FlatPresentSource& src, Graphics:
 	Graphics::TileSizeAlign total {};
 	Graphics::TileGetTextureTotalSize(pixel.guest_format, src.width, src.height, 1, 1, tile, false,
 	                                  total);
-	if (pitch == 0 || total.size == 0 || total.align == 0 ||
-	    (src.address & (total.align - 1u)) != 0) {
+	// Same rule as a category-16 scanout: present from the buffer base even when it is
+	// not the 64 KiB alignment a TV port requires.
+	if (pitch == 0 || total.size == 0 || total.align == 0) {
 		return false;
 	}
 	info                 = {};
