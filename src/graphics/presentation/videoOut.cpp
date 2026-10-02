@@ -71,6 +71,8 @@ constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ                       = 3;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED       = 1;
+// PSVR2 / Hmd2 scanout. Not a DCC category: the color surface is presented as-is.
+constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET          = 16;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY = 8;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED = 32;
 
@@ -541,6 +543,12 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	// and are presented (and, without --vr, mirrored onto the desktop window).
 	if (handle == VideoOutDriver::Impl::VIDEO_OUT_VR_HANDLE &&
 	    (IsSpecialBufferIndex(index) || !video_out->buffers[index].Occupied())) {
+		if (!IsSpecialBufferIndex(index)) {
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Hmd2 flat present: blanking unoccupied VR flip index=%d\n", index);
+			}
+		}
 		index = VIDEO_OUT_BUFFER_INDEX_BLANK;
 	}
 
@@ -559,18 +567,33 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 }
 
 Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
+	// Headset category 16 carries a color surface. DCC metadata on that registration is not a
+	// scanout compression mode, so classify it as uncompressed and present the color buffer.
+	const bool headset = category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET;
 	const auto compression = Graphics::ClassifyVideoOutCompression(
-	    category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, buffer.metadata_address,
-	    attribute.dcc_control, attribute.dcc_cb_register_clear_color);
-	if (attribute.reserved0 != 0 || attribute.aspect_ratio != 0 || attribute.width == 0 ||
-	    attribute.height == 0 || attribute.width > 16384 || attribute.height > 16384 ||
-	    attribute.pitch_in_pixel != 0 ||
+	    !headset && category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED,
+	    headset ? 0 : buffer.metadata_address, headset ? 0 : attribute.dcc_control,
+	    headset ? 0 : attribute.dcc_cb_register_clear_color);
+	const bool extra_fields =
+	    attribute.reserved0 != 0 || attribute.aspect_ratio != 0 || attribute.pitch_in_pixel != 0 ||
 	    (attribute.option & ~(VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY |
 	                          VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED)) != 0 ||
 	    attribute.tiling_mode != 0 || attribute.pad0 != 0 || attribute.reserved1[0] != 0 ||
-	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
-	    compression == Graphics::VideoOutCompression::Unsupported) {
+	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 ||
+	    (!headset && compression == Graphics::VideoOutCompression::Unsupported);
+	if (attribute.width == 0 || attribute.height == 0 || attribute.width > 16384 ||
+	    attribute.height > 16384 || buffer.data_address == 0 || (!headset && extra_fields)) {
 		EXIT("unsupported or invalid video-out surface attributes\n");
+	}
+	if (headset && extra_fields) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("VideoOut: headset buffer pass-through ignores tiling=%" PRIu32 " pitch=%" PRIu32
+			     " aspect=%" PRIu32 " option=0x%" PRIx64 " dcc=0x%08" PRIx32 " metadata=0x%016" PRIx64
+			     "\n",
+			     attribute.tiling_mode, attribute.pitch_in_pixel, attribute.aspect_ratio,
+			     attribute.option, attribute.dcc_control, buffer.metadata_address);
+		}
 	}
 	Graphics::VideoOutPixelFormatInfo pixel_format {};
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
@@ -1186,17 +1209,17 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
-	// Desktop has no headset panel. A mis-sized flip of the reprojection buffer is
-	// rebuilt at the real size. A parsed eye replaces only the smaller main/social
-	// buffer; a registered VR scanout is left alone and mirrored in Flip. --vr is unchanged.
+	// Desktop has no headset panel. A mis-sized flip of the reprojection buffer is rebuilt
+	// at the real size. The Hmd2 display buffer (or a parsed eye) replaces a smaller main
+	// image even when SetRenderConfig did not yield a descriptor. A registered VR scanout
+	// is left alone and mirrored in Flip. --vr is unchanged.
 	if (!special && !Config::VrEnabled()) {
 		Hmd2::FlatPresentSource flat {};
 		if (Hmd2::CopyFlatPresentSource(flat)) {
 			const bool address_match = source_info.data.address == flat.address &&
 			                           (source_info.extent.width != flat.width ||
 			                            source_info.extent.height != flat.height);
-			const bool promote       = flat.from_render_config &&
-			                     cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN &&
+			const bool promote       = cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN &&
 			                     (source_info.extent.width < flat.width ||
 			                      source_info.extent.height < flat.height);
 			if (address_match || promote) {
@@ -1210,6 +1233,14 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 						     source_info.extent.width, source_info.extent.height);
 					}
 					source_info = replacement;
+				} else {
+					static std::atomic_bool logged {false};
+					if (!logged.exchange(true, std::memory_order_relaxed)) {
+						LOGF("Hmd2 flat present: rejected %" PRIu32 "x%" PRIu32 " fmt=%" PRIu32
+						     " from 0x%016" PRIx64 " over %ux%u\n",
+						     flat.width, flat.height, flat.guest_format, flat.address,
+						     source_info.extent.width, source_info.extent.height);
+					}
 				}
 			}
 		}
@@ -1345,6 +1376,12 @@ bool FlipQueue::Flip(uint32_t micros) {
 				mirror_headset = true;
 				break;
 			}
+		}
+	}
+	if (mirror_headset) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Hmd2 flat present: mirroring VR bus onto the desktop window\n");
 		}
 	}
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
@@ -1574,11 +1611,18 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     attribute->option, category);
 
 	if (option != nullptr) {
+		LOGF("VideoOutRegisterBuffers2: rejected option=%p\n", option);
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
 	if (category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED &&
-	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED) {
+	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED &&
+	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET) {
+		LOGF("VideoOutRegisterBuffers2: rejected category=%d\n", category);
 		return VIDEO_OUT_ERROR_INVALID_CATEGORY;
+	}
+	if (category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET) {
+		LOGF("VideoOutRegisterBuffers2: category=%d accepted as uncompressed pass-through\n",
+		     category);
 	}
 
 	BufferAttributeGroup group {
@@ -1626,6 +1670,8 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		     buffer_index_start + i, buffer.data_address, buffer.metadata_address,
 		     attribute->dcc_control);
 	}
+	LOGF("VideoOutRegisterBuffers2: registered %" PRIu32 "x%" PRIu32 " category=%d buffers=%d\n",
+	     attribute->width, attribute->height, category, buffer_num);
 
 	return OK;
 }
