@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -183,6 +184,8 @@ struct BufferAttributeGroup {
 	int                      category = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED;
 	bool                     occupied = false;
 
+	[[nodiscard]] bool TryImageInfo(const VideoOutBuffer& buffer, Graphics::ImageInfo& info,
+	                                const char** reason) const;
 	[[nodiscard]] Graphics::ImageInfo ImageInfo(const VideoOutBuffer& buffer) const;
 };
 
@@ -566,7 +569,51 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	return OK;
 }
 
-Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
+static bool MatchesHmd2DisplayBuffer(uint64_t address, uint32_t width, uint32_t height) {
+	Hmd2::FlatPresentSource display {};
+	return Hmd2::CopyDisplayBuffer(display) && address != 0 && address == display.address &&
+	       width == display.width && height == display.height;
+}
+
+// Category-16 registrations are only worth showing when they are the reprojection display
+// buffer or another direct GPU color target. Host/junk pointers must not replace MAIN.
+static bool PresentableHeadsetColorTarget(uint64_t address, uint64_t bytes, uint32_t width,
+                                          uint32_t height) {
+	if (MatchesHmd2DisplayBuffer(address, width, height)) {
+		return true;
+	}
+	return LibKernel::Memory::IsDirectGpuRange(address, bytes);
+}
+
+static bool HeadsetRegistrationPresentable(const BufferAttributeGroup& group,
+                                           const VideoOutBuffer&       buffer) {
+	if (buffer.data_address == 0 || group.attribute.width == 0 || group.attribute.height == 0) {
+		return false;
+	}
+	if (group.category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET) {
+		return true;
+	}
+	Graphics::VideoOutPixelFormatInfo pixel {};
+	if (!Graphics::DecodeVideoOutPixelFormat(group.attribute.pixel_format, pixel)) {
+		return false;
+	}
+	Graphics::TileSizeAlign total {};
+	Graphics::TileGetTextureTotalSize(pixel.guest_format, group.attribute.width,
+	                                  group.attribute.height, 1, 1,
+	                                  Graphics::Prospero::TileMode::kRenderTarget, false, total);
+	return total.size != 0 &&
+	       PresentableHeadsetColorTarget(buffer.data_address, total.size, group.attribute.width,
+	                                     group.attribute.height);
+}
+
+bool BufferAttributeGroup::TryImageInfo(const VideoOutBuffer& buffer, Graphics::ImageInfo& info,
+                                        const char** reason) const {
+	const auto fail = [&](const char* why) {
+		if (reason != nullptr) {
+			*reason = why;
+		}
+		return false;
+	};
 	// Headset category 16 carries a color surface. DCC metadata on that registration is not a
 	// scanout compression mode, so classify it as uncompressed and present the color buffer.
 	const bool headset = category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET;
@@ -583,7 +630,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	    (!headset && compression == Graphics::VideoOutCompression::Unsupported);
 	if (attribute.width == 0 || attribute.height == 0 || attribute.width > 16384 ||
 	    attribute.height > 16384 || buffer.data_address == 0 || (!headset && extra_fields)) {
-		EXIT("unsupported or invalid video-out surface attributes\n");
+		return fail("unsupported or invalid video-out surface attributes");
 	}
 	if (headset && extra_fields) {
 		static std::atomic_bool logged {false};
@@ -597,7 +644,8 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	}
 	Graphics::VideoOutPixelFormatInfo pixel_format {};
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
-		EXIT("unsupported video-out pixel format: 0x%016" PRIx64 "\n", attribute.pixel_format);
+		LOGF("VideoOut: unsupported pixel format 0x%016" PRIx64 "\n", attribute.pixel_format);
+		return fail("unsupported video-out pixel format");
 	}
 	if (attribute.pixel_format == Graphics::VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -613,15 +661,22 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	Graphics::TileSizeAlign total {};
 	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
 	                                  1, 1, tile_mode, false, total);
-	// TV scanout allocations are 64 KiB aligned. An Hmd2 category-16 surface is an Agc color
-	// target: its base is often only 256-byte aligned, which still detiles from that address.
+	// TV scanout allocations are 64 KiB aligned. A real Hmd2 color target may be only 256-byte
+	// aligned; that waiver does not apply to a pointer outside the direct GPU VA band.
 	const bool scanout_aligned =
 	    total.align == 65536 &&
 	    (buffer.data_address & (static_cast<uint64_t>(total.align) - 1u)) == 0;
 	if (total.size == 0 || pitch == 0 || total.align == 0 || (!headset && !scanout_aligned)) {
-		EXIT("invalid video-out surface footprint or alignment size=%" PRIu32 " align=%" PRIu32
-		     " pitch=%" PRIu32 " address=0x%016" PRIx64 "\n",
+		LOGF("VideoOut: invalid footprint size=%" PRIu32 " align=%" PRIu32 " pitch=%" PRIu32
+		     " address=0x%016" PRIx64 "\n",
 		     total.size, total.align, pitch, buffer.data_address);
+		return fail("invalid video-out surface footprint or alignment");
+	}
+	if (headset && !PresentableHeadsetColorTarget(buffer.data_address, total.size, attribute.width,
+	                                             attribute.height)) {
+		LOGF("VideoOut: headset buffer 0x%016" PRIx64 " is not a direct GPU color target\n",
+		     buffer.data_address);
+		return fail("headset buffer is not a direct GPU color target");
 	}
 	if (headset) {
 		static std::atomic_bool logged {false};
@@ -632,7 +687,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 			     buffer.data_address);
 		}
 	}
-	Graphics::ImageInfo info {};
+	info                 = {};
 	info.data            = {buffer.data_address, total.size};
 	info.pixel_format    = pixel_format.format;
 	info.guest_format    = pixel_format.guest_format;
@@ -649,7 +704,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 		Graphics::TileSizeAlign dcc_size {};
 		if (!Graphics::TileGetDccSize(attribute.width, attribute.height, 1,
 		                              pixel_format.bytes_per_element, 1, tile_mode, dcc_size)) {
-			EXIT("invalid video-out DCC footprint\n");
+			return fail("invalid video-out DCC footprint");
 		}
 		info.metadata.range       = {buffer.metadata_address, dcc_size.size};
 		info.metadata.kind        = Graphics::ImageMetadataKind::Dcc;
@@ -658,7 +713,16 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	}
 	Graphics::ImageOps::Validate(info);
 	if (!Graphics::IsSupportedVideoOutFormat(info)) {
-		EXIT("unsupported normalized video-out format\n");
+		return fail("unsupported normalized video-out format");
+	}
+	return true;
+}
+
+Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
+	Graphics::ImageInfo info {};
+	const char*         reason = "invalid video-out surface";
+	if (!TryImageInfo(buffer, info, &reason)) {
+		EXIT("%s\n", reason != nullptr ? reason : "invalid video-out surface");
 	}
 	return info;
 }
@@ -694,8 +758,12 @@ static bool ImageInfoForFlatSource(const Hmd2::FlatPresentSource& src, Graphics:
 	Graphics::TileGetTextureTotalSize(pixel.guest_format, src.width, src.height, 1, 1, tile, false,
 	                                  total);
 	// Same rule as a category-16 scanout: present from the buffer base even when it is
-	// not the 64 KiB alignment a TV port requires.
+	// not the 64 KiB alignment a TV port requires. The caller has already rejected pointers
+	// that are not the Hmd2 display buffer or another direct GPU color target.
 	if (pitch == 0 || total.size == 0 || total.align == 0) {
+		return false;
+	}
+	if (!PresentableHeadsetColorTarget(src.address, total.size, src.width, src.height)) {
 		return false;
 	}
 	info                 = {};
@@ -715,6 +783,41 @@ static bool ImageInfoForFlatSource(const Hmd2::FlatPresentSource& src, Graphics:
 		return false;
 	}
 	Graphics::ImageOps::Validate(info);
+	return true;
+}
+
+static bool ResolveFlatSource(Hmd2::FlatPresentSource& out) {
+	if (!Hmd2::CopyFlatPresentSource(out)) {
+		return false;
+	}
+	Graphics::ImageInfo probe {};
+	if (ImageInfoForFlatSource(out, probe)) {
+		return true;
+	}
+	if (!out.from_render_config) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Hmd2 flat present: keeping MAIN social image; display buffer 0x%016" PRIx64
+			     " is not a direct GPU color target\n",
+			     out.address);
+		}
+		return false;
+	}
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		LOGF("Hmd2 flat present: parsed eye 0x%016" PRIx64
+		     " is not a direct GPU color target; using display buffer\n",
+		     out.address);
+	}
+	if (!Hmd2::CopyDisplayBuffer(out) || !ImageInfoForFlatSource(out, probe)) {
+		static std::atomic_bool kept {false};
+		if (!kept.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Hmd2 flat present: keeping MAIN social image; display buffer 0x%016" PRIx64
+			     " is not a direct GPU color target\n",
+			     out.address);
+		}
+		return false;
+	}
 	return true;
 }
 
@@ -1225,13 +1328,12 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
-	// Desktop has no headset panel. A mis-sized flip of the reprojection buffer is rebuilt
-	// at the real size. The Hmd2 display buffer (or a parsed eye) replaces a smaller main
-	// image even when SetRenderConfig did not yield a descriptor. A registered VR scanout
-	// is left alone and mirrored in Flip. --vr is unchanged.
+	// Desktop has no headset panel. Prefer the Hmd2 display buffer when SetRenderConfig did
+	// not leave a presentable eye. A junk category-16 pointer must not replace MAIN.
+	// --vr is unchanged.
 	if (!special && !Config::VrEnabled()) {
 		Hmd2::FlatPresentSource flat {};
-		if (Hmd2::CopyFlatPresentSource(flat)) {
+		if (ResolveFlatSource(flat)) {
 			const bool address_match = source_info.data.address == flat.address &&
 			                           (source_info.extent.width != flat.width ||
 			                            source_info.extent.height != flat.height);
@@ -1385,19 +1487,43 @@ bool FlipQueue::Flip(uint32_t micros) {
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
 	bool due = true;
 	bool mirror_headset = false;
+	bool vr_not_presentable = false;
 	if (!Config::VrEnabled()) {
 		for (size_t i = 0; i < count; i++) {
-			if (requests[i].cfg->bus == VIDEO_OUT_BUS_TYPE_VR &&
-			    !IsSpecialBufferIndex(requests[i].index)) {
+			if (requests[i].cfg->bus != VIDEO_OUT_BUS_TYPE_VR ||
+			    IsSpecialBufferIndex(requests[i].index)) {
+				continue;
+			}
+			auto*       port  = requests[i].cfg;
+			const int   index = requests[i].index;
+			Common::LockGuard lock(port->mutex);
+			if (index < 0 || index >= VIDEO_OUT_BUFFER_NUM_MAX) {
+				continue;
+			}
+			const auto& surface = port->buffers[index];
+			if (!surface.Occupied() ||
+			    surface.group_index < 0 ||
+			    surface.group_index >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX) {
+				continue;
+			}
+			const auto& group = port->groups[surface.group_index];
+			if (HeadsetRegistrationPresentable(group, surface)) {
 				mirror_headset = true;
 				break;
 			}
+			vr_not_presentable = true;
 		}
 	}
 	if (mirror_headset) {
 		static std::atomic_bool logged {false};
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
 			LOGF("Hmd2 flat present: mirroring VR bus onto the desktop window\n");
+		}
+	} else if (vr_not_presentable) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Hmd2 flat present: keeping MAIN social image; VR buffer is not a direct GPU "
+			     "color target\n");
 		}
 	}
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
@@ -1662,7 +1788,18 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		    .data_address     = data_address,
 		    .metadata_address = metadata_address,
 		});
-		(void)group.ImageInfo(registrations.back());
+		if (category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET) {
+			Graphics::ImageInfo info {};
+			const char*         reason = nullptr;
+			if (!group.TryImageInfo(registrations.back(), info, &reason)) {
+				LOGF("VideoOutRegisterBuffers2: rejected headset buffer data=0x%016" PRIx64
+				     " (%s)\n",
+				     data_address, reason != nullptr ? reason : "invalid surface");
+				return VIDEO_OUT_ERROR_INVALID_MEMORY;
+			}
+		} else {
+			(void)group.ImageInfo(registrations.back());
+		}
 	}
 
 	Common::LockGuard lock(ctx->mutex);
@@ -1725,7 +1862,18 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
 	    .occupied  = true,
 	};
 	for (const auto& buffer: ctx->buffers) {
-		if (buffer.group_index == set_index) {
+		if (buffer.group_index != set_index) {
+			continue;
+		}
+		if (replacement.category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET) {
+			Graphics::ImageInfo info {};
+			const char*         reason = nullptr;
+			if (!replacement.TryImageInfo(buffer, info, &reason)) {
+				LOGF("VideoOutSubmitChangeBufferAttribute2: rejected headset buffer (%s)\n",
+				     reason != nullptr ? reason : "invalid surface");
+				return VIDEO_OUT_ERROR_INVALID_MEMORY;
+			}
+		} else {
 			(void)replacement.ImageInfo(buffer);
 		}
 	}

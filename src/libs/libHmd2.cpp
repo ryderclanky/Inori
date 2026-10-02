@@ -123,12 +123,7 @@ bool HeadsetInitialized() {
 	return g_initialized.load(std::memory_order_acquire);
 }
 
-bool CopyFlatPresentSource(FlatPresentSource& out) {
-	std::scoped_lock lock {g_flat_mutex};
-	if (g_flat_source.from_render_config && g_flat_source.address != 0) {
-		out = g_flat_source;
-		return true;
-	}
+static bool FillDisplayBuffer(FlatPresentSource& out) {
 	const auto address = g_display_buffer.load(std::memory_order_acquire);
 	if (address == 0) {
 		return false;
@@ -141,6 +136,21 @@ bool CopyFlatPresentSource(FlatPresentSource& out) {
 	out.tile_mode          = static_cast<uint32_t>(Graphics::Prospero::TileMode::kRenderTarget);
 	out.from_render_config = false;
 	return true;
+}
+
+bool CopyDisplayBuffer(FlatPresentSource& out) {
+	std::scoped_lock lock {g_flat_mutex};
+	return FillDisplayBuffer(out);
+}
+
+bool CopyFlatPresentSource(FlatPresentSource& out) {
+	std::scoped_lock lock {g_flat_mutex};
+	if (g_flat_source.from_render_config && g_flat_source.address != 0) {
+		out = g_flat_source;
+		return true;
+	}
+	// SetRenderConfig(NULL) clears the parsed eye. The reprojection display buffer remains.
+	return FillDisplayBuffer(out);
 }
 
 static bool GuestRangeReadable(const void* ptr, size_t size, size_t& available) {

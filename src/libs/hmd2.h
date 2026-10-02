@@ -32,8 +32,10 @@ struct FlatPresentSource {
 // True after sceHmd2Initialize until terminate. Video-out uses this to accept headset
 // modes for the flat desktop mirror without requiring --vr.
 [[nodiscard]] bool HeadsetInitialized();
-// Display buffer, or the eye texture from the latest non-null render config.
+// Parsed eye when SetRenderConfig provided one, otherwise the reprojection display buffer.
 [[nodiscard]] bool CopyFlatPresentSource(FlatPresentSource& out);
+// Reprojection display buffer only. Used when a parsed eye is not a GPU color target.
+[[nodiscard]] bool CopyDisplayBuffer(FlatPresentSource& out);
 
 } // namespace Libs::Hmd2
 
