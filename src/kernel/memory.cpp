@@ -3216,6 +3216,20 @@ int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled() {
 	return 0;
 }
 
+bool IsDirectGpuRange(uint64_t address, uint64_t size) {
+	if (address == 0 || size == 0 || (address & 0xFFu) != 0 || address + size < address ||
+	    g_virtual_ranges == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	VirtualRanges::Range                  range {};
+	if (!g_virtual_ranges->Query(address, 0, &range) || range.type != VirtualRangeType::Direct) {
+		return false;
+	}
+	const uint64_t end = range.start + range.size;
+	return address >= range.start && size <= end - address;
+}
+
 int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot) {
 	PRINT_NAME();
 
