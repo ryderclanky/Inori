@@ -17,7 +17,23 @@ struct ReprojectionState {
 	std::atomic<uint32_t> timing_us {3000};
 };
 
+// Guest color surface chosen for the desktop window when no OpenXR headset is connected.
+// guest_format is Prospero::BufferFormat. tile_mode is Prospero::TileMode.
+struct FlatPresentSource {
+	uint64_t address            = 0;
+	uint32_t width              = 0;
+	uint32_t height             = 0;
+	uint32_t guest_format       = 0;
+	uint32_t tile_mode          = 0;
+	bool     from_render_config = false;
+};
+
 [[nodiscard]] ReprojectionState* GetReprojectionState();
+// True after sceHmd2Initialize until terminate. Video-out uses this to accept headset
+// modes for the flat desktop mirror without requiring --vr.
+[[nodiscard]] bool HeadsetInitialized();
+// Display buffer, or the eye texture from the latest non-null render config.
+[[nodiscard]] bool CopyFlatPresentSource(FlatPresentSource& out);
 
 } // namespace Libs::Hmd2
 

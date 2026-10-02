@@ -1,6 +1,8 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/shader/shaderBindings.h"
+#include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -8,6 +10,7 @@
 #include "loader/symbolDatabase.h"
 #include "loader/timer.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -91,6 +94,9 @@ static std::atomic<bool> g_initialized = false;
 static std::mutex g_reprojection_mutex;
 static std::atomic<ReprojectionState*> g_reprojection_state {nullptr};
 static std::atomic<int32_t> g_hmd_handle {0};
+static std::mutex g_flat_mutex;
+static std::atomic<uint64_t> g_display_buffer {0};
+static FlatPresentSource g_flat_source {};
 static constexpr int32_t HMD_HANDLE = 0x0F000000;
 static constexpr int32_t ERROR_ALREADY_OPENED = -1972240381; // 0x8a720003
 static constexpr int32_t ERROR_INVALID_HANDLE = -1972240375; // 0x8a720009
@@ -111,6 +117,152 @@ static void FillDeviceInformation(SceHmd2DeviceInformation* info) {
 
 ReprojectionState* GetReprojectionState() {
 	return g_reprojection_state.load(std::memory_order_acquire);
+}
+
+bool HeadsetInitialized() {
+	return g_initialized.load(std::memory_order_acquire);
+}
+
+bool CopyFlatPresentSource(FlatPresentSource& out) {
+	std::scoped_lock lock {g_flat_mutex};
+	if (g_flat_source.from_render_config && g_flat_source.address != 0) {
+		out = g_flat_source;
+		return true;
+	}
+	const auto address = g_display_buffer.load(std::memory_order_acquire);
+	if (address == 0) {
+		return false;
+	}
+	out                    = {};
+	out.address            = address;
+	out.width              = PANEL_WIDTH;
+	out.height             = PANEL_HEIGHT;
+	out.guest_format       = static_cast<uint32_t>(Graphics::Prospero::BufferFormat::k10_10_10_2UNorm);
+	out.tile_mode          = static_cast<uint32_t>(Graphics::Prospero::TileMode::kRenderTarget);
+	out.from_render_config = false;
+	return true;
+}
+
+static bool GuestRangeReadable(const void* ptr, size_t size, size_t& available) {
+	available = 0;
+	if (!LooksLikeGuestPtr(ptr) || size == 0) {
+		return false;
+	}
+	void* start = nullptr;
+	void* end   = nullptr;
+	int   prot  = 0;
+	if (LibKernel::Memory::KernelQueryMemoryProtection(const_cast<void*>(ptr), &start, &end,
+	                                                   &prot) != OK) {
+		return false;
+	}
+	const auto begin = reinterpret_cast<uintptr_t>(ptr);
+	const auto limit = reinterpret_cast<uintptr_t>(end);
+	if (limit < begin) {
+		return false;
+	}
+	available = static_cast<size_t>(limit - begin);
+	return available > 0;
+}
+
+static bool DecodePresentableTexture(const uint32_t words[8], FlatPresentSource& out) {
+	Graphics::ShaderTextureResource tex {};
+	static_assert(sizeof(tex.fields) == sizeof(uint32_t) * 8);
+	std::memcpy(tex.fields, words, sizeof(tex.fields));
+	if (tex.IsNull() || tex.Type() != Graphics::Prospero::ImageType::kColor2D) {
+		return false;
+	}
+	const auto tile = tex.TileMode();
+	if (tile != Graphics::Prospero::TileMode::kRenderTarget &&
+	    tile != Graphics::Prospero::TileMode::kLinear &&
+	    tile != Graphics::Prospero::TileMode::kStandard4KB &&
+	    tile != Graphics::Prospero::TileMode::kStandard64KB) {
+		return false;
+	}
+	const auto format = tex.Format();
+	switch (format) {
+		case Graphics::Prospero::BufferFormat::k10_10_10_2UNorm:
+		case Graphics::Prospero::BufferFormat::k8_8_8_8UNorm:
+		case Graphics::Prospero::BufferFormat::k8_8_8_8Srgb:
+		case Graphics::Prospero::BufferFormat::k16_16_16_16Float: break;
+		default: return false;
+	}
+	// Reject descriptors with reserved bits set (same filter the texture path uses).
+	if ((words[1] & 0x20000000u) != 0 || (words[2] & 0x70003000u) != 0 ||
+	    (words[4] & 0xe000e000u) != 0 || (words[5] & 0xf9000000u) != 0 ||
+	    (words[6] & 0x00007b00u) != 0) {
+		return false;
+	}
+	const uint32_t width  = static_cast<uint32_t>(tex.Width5()) + 1u;
+	const uint32_t height = static_cast<uint32_t>(tex.Height5()) + 1u;
+	if (width < 320 || height < 240 || width > 8192 || height > 8192) {
+		return false;
+	}
+	size_t available = 0;
+	if (!GuestRangeReadable(reinterpret_cast<const void*>(tex.Base40()), 4096, available)) {
+		return false;
+	}
+	const int score = static_cast<int>(width * height) +
+	                  (tile == Graphics::Prospero::TileMode::kRenderTarget ? 1'000'000 : 0);
+	const int previous = out.address == 0
+	                         ? -1
+	                         : static_cast<int>(out.width * out.height) +
+	                               (out.tile_mode == static_cast<uint32_t>(
+	                                                    Graphics::Prospero::TileMode::kRenderTarget)
+	                                    ? 1'000'000
+	                                    : 0);
+	if (score <= previous) {
+		return false;
+	}
+	out.address            = tex.Base40();
+	out.width              = width;
+	out.height             = height;
+	out.guest_format       = static_cast<uint32_t>(format);
+	out.tile_mode          = static_cast<uint32_t>(tile);
+	out.from_render_config = true;
+	return true;
+}
+
+// sceHmd2ReprojectionSetRenderConfig's layout is not in the public headers we ship.
+// Eye textures are Agc color descriptors, either embedded or one pointer away.
+static bool ParseRenderConfig(const void* config, FlatPresentSource& out) {
+	size_t available = 0;
+	if (!GuestRangeReadable(config, 32, available)) {
+		return false;
+	}
+	const auto bytes = std::min(available, static_cast<size_t>(256));
+	if (bytes < 32) {
+		return false;
+	}
+	uint8_t blob[256] {};
+	std::memcpy(blob, config, bytes);
+	bool found = false;
+	for (size_t offset = 0; offset + 32 <= bytes; offset += 8) {
+		uint32_t words[8] {};
+		std::memcpy(words, blob + offset, sizeof(words));
+		found = DecodePresentableTexture(words, out) || found;
+	}
+	for (size_t offset = 0; offset + sizeof(uint64_t) <= bytes; offset += sizeof(uint64_t)) {
+		uint64_t pointer = 0;
+		std::memcpy(&pointer, blob + offset, sizeof(pointer));
+		if (pointer >= reinterpret_cast<uintptr_t>(config) &&
+		    pointer < reinterpret_cast<uintptr_t>(config) + bytes) {
+			continue;
+		}
+		size_t pointed = 0;
+		if (!GuestRangeReadable(reinterpret_cast<const void*>(pointer), 32, pointed)) {
+			continue;
+		}
+		uint32_t words[8] {};
+		std::memcpy(words, reinterpret_cast<const void*>(pointer), sizeof(words));
+		found = DecodePresentableTexture(words, out) || found;
+	}
+	return found;
+}
+
+static void ClearFlatSource() {
+	std::scoped_lock lock {g_flat_mutex};
+	g_flat_source = {};
+	g_display_buffer.store(0, std::memory_order_release);
 }
 
 static Graphics::SizeAlign ReprojectionDisplaySize() {
@@ -195,6 +347,8 @@ Hmd2ReprojectionInitialize(const SceHmd2ReprojectionInitializeParam* param, void
 		state->timing_us.store(static_cast<uint32_t>(param->reprojectionTiming),
 		                      std::memory_order_relaxed);
 	}
+	g_display_buffer.store(reinterpret_cast<uint64_t>(param->pDisplayBuff),
+	                       std::memory_order_release);
 	g_reprojection_state.store(state, std::memory_order_release);
 	LOGF("Hmd2: reprojection initialized work=%p display=%p size=%" PRIu64 " timing=%u\n",
 	     static_cast<void*>(state), param->pDisplayBuff, display_size.m_size,
@@ -262,6 +416,7 @@ static int32_t KYTY_SYSV_ABI Hmd2Terminate() {
 	PRINT_NAME();
 	g_hmd_handle.store(0);
 	g_initialized.store(false);
+	ClearFlatSource();
 	LOGF("Hmd2: terminated\n");
 	return OK;
 }
@@ -289,7 +444,26 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetRenderConfig(const void* config)
 	if (GetReprojectionState() == nullptr) {
 		return ERROR_REPROJECTION_NOT_INITIALIZED;
 	}
-	LOGF("Hmd2: SetRenderConfig config=%p\n", config);
+	if (config == nullptr) {
+		std::scoped_lock lock {g_flat_mutex};
+		g_flat_source = {};
+		LOGF("Hmd2: SetRenderConfig cleared\n");
+		return OK;
+	}
+	FlatPresentSource parsed {};
+	if (!ParseRenderConfig(config, parsed)) {
+		std::scoped_lock lock {g_flat_mutex};
+		g_flat_source = {};
+		LOGF("Hmd2: SetRenderConfig config=%p (no presentable eye descriptor)\n", config);
+		return OK;
+	}
+	{
+		std::scoped_lock lock {g_flat_mutex};
+		g_flat_source = parsed;
+	}
+	LOGF("Hmd2: SetRenderConfig config=%p source=0x%016" PRIx64 " %" PRIu32 "x%" PRIu32
+	     " fmt=%" PRIu32 "\n",
+	     config, parsed.address, parsed.width, parsed.height, parsed.guest_format);
 	return OK;
 }
 
@@ -352,6 +526,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionTerminate() {
 	if (auto* state = g_reprojection_state.exchange(nullptr)) {
 		state->~ReprojectionState();
 	}
+	ClearFlatSource();
 	LOGF("Hmd2: reprojection terminated\n");
 	return OK;
 }
