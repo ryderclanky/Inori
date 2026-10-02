@@ -1,0 +1,22 @@
+﻿Beat Saber Continue UI - host controls (Kyty Desktop)
+====================================================
+Build: kyty_emulator rebuilt and copied to _Build\windows\install\
+Launch example:
+  kyty_emulator.exe --game "C:\Users\ryder\Documents\ps5games\Beat Saber\PPSA15035-app" --trace --vr
+
+Focus the emulator window, then press one of:
+
+  Keyboard:  Space  or  Enter  or  J
+  Mouse:     Left click
+  Xbox pad:  A  (South). Right Trigger alone also sends R2.
+
+Guest mapping:
+  Cross (confirm) + R2 full press (Sense trigger click)
+  Applied on shared pad state used by pad handle 1 and Sense handles 2/3
+
+Pad open:
+  type 3 -> handle 2, type 4 -> handle 3 (accepted; previously 0x80920001)
+
+Log check for Sense open:
+  look for: -> handle = 2 (Sense/VR UI pad open ok)
+            -> handle = 3 (Sense/VR UI pad open ok)

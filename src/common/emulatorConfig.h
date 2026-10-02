@@ -73,7 +73,9 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = false;
 	bool                   playgo_hack_enabled         = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	bool red_zone_protection_enabled = false;
+	// Windows VEH runs on the guest stack (unlike Linux SA_ONSTACK). Guest SysV red-zone
+	// spills are otherwise clobbered by GPU soft-fault handling — enable by default.
+	bool red_zone_protection_enabled = true;
 #endif
 	Keymap keymap;
 };

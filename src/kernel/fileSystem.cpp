@@ -1223,6 +1223,41 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
+	PRINT_NAME();
+
+	if (path == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (length < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto real_file_name = g_mount_points->ResolvePath(path);
+	if (Common::IsArchivePath(real_file_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
+
+	if (Common::File::IsDirectoryExisting(real_file_name)) {
+		return KERNEL_ERROR_EISDIR;
+	}
+
+	if (!Common::File::IsFileExisting(real_file_name)) {
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	Common::File file;
+	if (!file.Open(real_file_name, Common::File::Mode::ReadWrite) ||
+	    !file.Truncate(static_cast<uint64_t>(length))) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tKernelTruncate (size = %" PRId64 ") file: %s\n", length, path);
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	PRINT_NAME();
 

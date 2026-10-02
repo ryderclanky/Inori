@@ -320,6 +320,10 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
+			// Host Xbox A (South/Cross): also pulse R2 as Sense trigger for Unity Continue.
+			if (button == Controller::PAD_BUTTON_CROSS) {
+				Controller::SetAxis(f.id, Controller::Axis::TriggerRight, f.down ? 255 : 0);
+			}
 		}
 	}
 

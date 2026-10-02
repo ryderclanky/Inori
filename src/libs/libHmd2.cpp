@@ -6,10 +6,12 @@
 #include "libs/hmd2.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
+#include "loader/timer.h"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <new>
 
@@ -88,6 +90,24 @@ static_assert(offsetof(SceHmd2ReprojectionInitializeParam, reserved) == 52);
 static std::atomic<bool> g_initialized = false;
 static std::mutex g_reprojection_mutex;
 static std::atomic<ReprojectionState*> g_reprojection_state {nullptr};
+static std::atomic<int32_t> g_hmd_handle {0};
+static constexpr int32_t HMD_HANDLE = 0x0F000000;
+static constexpr int32_t ERROR_ALREADY_OPENED = -1972240381; // 0x8a720003
+static constexpr int32_t ERROR_INVALID_HANDLE = -1972240375; // 0x8a720009
+
+static bool LooksLikeGuestPtr(const void* p) {
+	return reinterpret_cast<uintptr_t>(p) > 0x10000u;
+}
+
+static void FillDeviceInformation(SceHmd2DeviceInformation* info) {
+	*info = {};
+	// Always report a seated virtual headset so VR init can proceed without OpenXR.
+	info->status                 = 0; // READY
+	info->hmuMount               = 1;
+	info->lensSeparationDistance = 63;
+	info->deviceInfo.panelResolution = {PANEL_WIDTH, PANEL_HEIGHT};
+	info->virtualImageDistance       = 2.0f;
+}
 
 ReprojectionState* GetReprojectionState() {
 	return g_reprojection_state.load(std::memory_order_acquire);
@@ -123,21 +143,10 @@ static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* 
 	if (info == nullptr) {
 		return ERROR_PARAMETER_NULL;
 	}
-	*info = {};
-	if (Config::VrEnabled()) {
-		// Virtual headset defaults: READY, MOUNT, 63 mm lens separation.
-		info->hmuMount               = 1;
-		info->lensSeparationDistance = 63;
-		// Headset characteristics: 4000x2040 panel and 2 m virtual image distance.
-		info->deviceInfo.panelResolution = {PANEL_WIDTH, PANEL_HEIGHT};
-		info->virtualImageDistance       = 2.0f;
-		// Host presentation has no emulated headset scan-out delay; latency remains zero.
-	} else {
-		info->status = 2; // SCE_HMD2_DEVICE_STATUS_NOT_DETECTED
-	}
-	LOGF("Hmd2: device status=%u panel=%ux%u mounted=%u\n", info->status,
+	FillDeviceInformation(info);
+	LOGF("Hmd2: device status=%u panel=%ux%u mounted=%u vr_flag=%s\n", info->status,
 	     info->deviceInfo.panelResolution.width, info->deviceInfo.panelResolution.height,
-	     info->hmuMount);
+	     info->hmuMount, Config::VrEnabled() ? "enabled" : "disabled");
 	return OK;
 }
 
@@ -201,14 +210,13 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionEnableVrMode(uint64_t output_mode) 
 	if (output_mode != OUTPUT_MODE_89_91HZ && output_mode != OUTPUT_MODE_119_88HZ) {
 		return VideoOut::VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
-	if (!Config::VrEnabled()) {
-		return VideoOut::VIDEO_OUT_ERROR_NO_DEVICE;
-	}
+	// Soft virtual headset: allow VR mode even without --vr so psvr2 init can proceed.
 	uint64_t expected = 0;
 	if (!state->output_mode.compare_exchange_strong(expected, output_mode)) {
 		return ERROR_REPROJECTION_IN_VR_MODE;
 	}
-	LOGF("Hmd2: VR output mode=0x%" PRIx64 "\n", output_mode);
+	LOGF("Hmd2: VR output mode=0x%" PRIx64 " (vr_flag=%s)\n", output_mode,
+	     Config::VrEnabled() ? "enabled" : "disabled");
 	return OK;
 }
 
@@ -224,17 +232,178 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetTiming(int32_t timing) {
 	return OK;
 }
 
+
+static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t index,
+                                      const void* param) {
+	PRINT_NAME();
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INITIALIZED;
+	}
+	(void)param;
+	LOGF("Hmd2: open user=%d type=%d index=%d\n", user_id, type, index);
+	int32_t expected = 0;
+	if (!g_hmd_handle.compare_exchange_strong(expected, HMD_HANDLE)) {
+		return ERROR_ALREADY_OPENED;
+	}
+	return HMD_HANDLE;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2Close(int32_t handle) {
+	PRINT_NAME();
+	if (handle != HMD_HANDLE || g_hmd_handle.load() != HMD_HANDLE) {
+		return ERROR_INVALID_HANDLE;
+	}
+	g_hmd_handle.store(0);
+	LOGF("Hmd2: closed handle=0x%x\n", handle);
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2Terminate() {
+	PRINT_NAME();
+	g_hmd_handle.store(0);
+	g_initialized.store(false);
+	LOGF("Hmd2: terminated\n");
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformationByHandle(int32_t handle,
+                                                              SceHmd2DeviceInformation* info) {
+	PRINT_NAME();
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INITIALIZED;
+	}
+	if (handle != HMD_HANDLE && g_hmd_handle.load() != handle) {
+		return ERROR_INVALID_HANDLE;
+	}
+	if (info == nullptr) {
+		return ERROR_PARAMETER_NULL;
+	}
+	FillDeviceInformation(info);
+	LOGF("Hmd2: device-by-handle status=%u panel=%ux%u\n", info->status,
+	     info->deviceInfo.panelResolution.width, info->deviceInfo.panelResolution.height);
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetRenderConfig(const void* config) {
+	PRINT_NAME();
+	if (GetReprojectionState() == nullptr) {
+		return ERROR_REPROJECTION_NOT_INITIALIZED;
+	}
+	LOGF("Hmd2: SetRenderConfig config=%p\n", config);
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionGetStatus(uint32_t* status) {
+	PRINT_NAME();
+	if (GetReprojectionState() == nullptr) {
+		return ERROR_REPROJECTION_NOT_INITIALIZED;
+	}
+	// Only write when the arg looks like a guest pointer (not a small enum/flag).
+	if (LooksLikeGuestPtr(status)) {
+		*status = 0; // idle / ready
+	}
+	return OK;
+}
+
+// Returns predicted display time in microseconds (by value). Writing through a
+// mistaken out-pointer previously faulted on address 0x1 during psvr2 frame setup.
+static uint64_t KYTY_SYSV_ABI Hmd2ReprojectionGetPredictedDisplayTime() {
+	PRINT_NAME();
+	auto* state = GetReprojectionState();
+	uint32_t timing = 3000;
+	if (state != nullptr) {
+		timing = state->timing_us.load(std::memory_order_relaxed);
+	}
+	return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0) + timing;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(const void* param) {
+	PRINT_NAME();
+	if (GetReprojectionState() == nullptr) {
+		return ERROR_REPROJECTION_NOT_INITIALIZED;
+	}
+	(void)param;
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(const void* param) {
+	PRINT_NAME();
+	if (GetReprojectionState() == nullptr) {
+		return ERROR_REPROJECTION_NOT_INITIALIZED;
+	}
+	(void)param;
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionDisableVrMode() {
+	PRINT_NAME();
+	auto* state = GetReprojectionState();
+	if (state == nullptr) {
+		return ERROR_REPROJECTION_NOT_INITIALIZED;
+	}
+	state->output_mode.store(0, std::memory_order_release);
+	LOGF("Hmd2: VR mode disabled\n");
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionTerminate() {
+	PRINT_NAME();
+	std::scoped_lock lock {g_reprojection_mutex};
+	if (auto* state = g_reprojection_state.exchange(nullptr)) {
+		state->~ReprojectionState();
+	}
+	LOGF("Hmd2: reprojection terminated\n");
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2SetVibration(int32_t handle, const void* param) {
+	PRINT_NAME();
+	(void)handle;
+	(void)param;
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(void* result) {
+	PRINT_NAME();
+	if (LooksLikeGuestPtr(result)) {
+		std::memset(result, 0, 64);
+	}
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2GazeGetResultForFoveatedRendering(void* result) {
+	PRINT_NAME();
+	if (LooksLikeGuestPtr(result)) {
+		std::memset(result, 0, 64);
+	}
+	return OK;
+}
+
 } // namespace Hmd2
 
 LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("c812oYs7Vsc", Hmd2::Hmd2Initialize);
 	LIB_FUNC("bIi4YUfSRys", Hmd2::Hmd2GetDeviceInformation);
+	LIB_FUNC("4BlE4IPXP0Q", Hmd2::Hmd2GetDeviceInformationByHandle);
+	LIB_FUNC("f3kPeoTZnIE", Hmd2::Hmd2Open);
+	LIB_FUNC("oPhtjySuHa8", Hmd2::Hmd2Close);
+	LIB_FUNC("QU2M1pPNbaY", Hmd2::Hmd2Terminate);
 	LIB_FUNC("gF8+lvc7GuQ", Hmd2::Hmd2GetFieldOfViewWithoutHandle);
 	LIB_FUNC("U-CnbmeyYaA", Hmd2::Hmd2ReprojectionQueryBufferSizeAlign);
 	LIB_FUNC("-C2nkoEYOnU", Hmd2::Hmd2ReprojectionQueryDisplayBufferSizeAlign);
 	LIB_FUNC("C0rPwER-yxg", Hmd2::Hmd2ReprojectionInitialize);
+	LIB_FUNC("4Q11W4M2h5Q", Hmd2::Hmd2ReprojectionTerminate);
 	LIB_FUNC("VVvFh51o20s", Hmd2::Hmd2ReprojectionEnableVrMode);
+	LIB_FUNC("wj1kOyNF4vM", Hmd2::Hmd2ReprojectionDisableVrMode);
 	LIB_FUNC("FkQX7rjFomk", Hmd2::Hmd2ReprojectionSetTiming);
+	LIB_FUNC("hA9LshbSkzw", Hmd2::Hmd2ReprojectionSetRenderConfig);
+	LIB_FUNC("8GkaY2B7opM", Hmd2::Hmd2ReprojectionGetStatus);
+	LIB_FUNC("SVEG+1D7qHA", Hmd2::Hmd2ReprojectionGetPredictedDisplayTime);
+	LIB_FUNC("xMo9ENEu2E0", Hmd2::Hmd2ReprojectionSetParam);
+	LIB_FUNC("Ocf081WpBpA", Hmd2::Hmd2ReprojectionBeginFrame);
+	LIB_FUNC("Al4qjNREVQQ", Hmd2::Hmd2SetVibration);
+	LIB_FUNC("lAoFUedcfqA", Hmd2::Hmd2GazeGetResult);
+	LIB_FUNC("retc+-uRMhk", Hmd2::Hmd2GazeGetResultForFoveatedRendering);
 }
 
 } // namespace Libs

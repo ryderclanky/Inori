@@ -768,15 +768,32 @@ int KYTY_SYSV_ABI PadInit() {
 	return OK;
 }
 
+// Beat Saber / PSVR2 opens Sense pads as type 3 and 4 (left/right).
 static bool PadOpenArgsAreValid(int user_id, int type, int index) {
 	constexpr int user_id_system     = 0xff;
 	constexpr int port_type_standard = 0;
 	constexpr int port_type_special  = 2;
+	constexpr int port_type_sense_a  = 3;
+	constexpr int port_type_sense_b  = 4;
 	constexpr int port_type_remote   = 16;
-	const bool    personal_port =
-	    user_id == Config::GetUserId() && (type == port_type_standard || type == port_type_special);
+	const bool personal_port =
+	    user_id == Config::GetUserId() &&
+	    (type == port_type_standard || type == port_type_special || type == port_type_sense_a ||
+	     type == port_type_sense_b);
 	const bool system_remote_control = user_id == user_id_system && type == port_type_remote;
 	return index == 0 && (personal_port || system_remote_control);
+}
+
+static int32_t PadHandleForType(int type) {
+	switch (type) {
+		case 3: return 2; // Sense / VR pad A
+		case 4: return 3; // Sense / VR pad B
+		default: return 1; // standard DualSense / special / remote
+	}
+}
+
+static bool PadIsOpenHandle(int handle) {
+	return handle == 1 || handle == 2 || handle == 3;
 }
 
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
@@ -794,8 +811,8 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 		return pad_error_invalid_arg;
 	}
 
-	int handle = 1;
-
+	const int handle = PadHandleForType(type);
+	LOGF("\t -> handle = %d (Sense/VR UI pad open ok)\n", handle);
 	return handle;
 }
 
@@ -813,13 +830,13 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 		return pad_error_device_no_handle;
 	}
 
-	return 1;
+	return PadHandleForType(type);
 }
 
 int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 
@@ -832,7 +849,7 @@ int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable) {
 int KYTY_SYSV_ABI PadSetAngularVelocityDeadbandState(int handle, bool enable) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 
@@ -844,7 +861,7 @@ int KYTY_SYSV_ABI PadSetAngularVelocityDeadbandState(int handle, bool enable) {
 int KYTY_SYSV_ABI PadResetOrientation(int handle) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 
@@ -860,7 +877,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 
 	g_controller->GetConnectionInfo(&connected, &connected_count);
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 	if (info == nullptr) {
@@ -875,6 +892,11 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 	info->stick_dead_zone_left  = controller_get_axis(-32768, 32767, 8000) - 128;
 	info->stick_dead_zone_right = controller_get_axis(-32768, 32767, 8000) - 128;
 	info->connection_type       = 0;
+	// Sense/VR handles: always report connected so Unity UI can receive select.
+	if (handle == 2 || handle == 3) {
+		connected       = true;
+		connected_count = std::max(connected_count, 1);
+	}
 	info->connected_count       = static_cast<uint8_t>(std::min(connected_count, 255));
 	info->connected             = connected;
 	info->device_class          = 0;
@@ -885,7 +907,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 	if (is_remote == nullptr) {
@@ -899,7 +921,7 @@ int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote) {
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 	if (data == nullptr) {
@@ -912,6 +934,11 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 
 	g_controller->ReadState(&state, &connected, &connected_count);
 
+	if (handle == 2 || handle == 3) {
+		connected       = true;
+		connected_count = std::max(connected_count, 1);
+	}
+
 	pad_fill_data(data, state, connected, connected_count);
 
 	return OK;
@@ -921,7 +948,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(num < 1 || num > 64);
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 	if (data == nullptr) {
@@ -936,9 +963,18 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 	int ret_num = g_controller->ReadStates(states, num, &connected, &connected_count);
 
+	if (handle == 2 || handle == 3) {
+		connected       = true;
+		connected_count = std::max(connected_count, 1);
+	}
+
 	if (!connected || ret_num == 0) {
 		if (connected) {
 			g_controller->ReadState(&states[0], &connected, &connected_count);
+			if (handle == 2 || handle == 3) {
+				connected       = true;
+				connected_count = std::max(connected_count, 1);
+			}
 		}
 		ret_num = 1;
 	}
@@ -953,7 +989,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 	if (param == nullptr) {
@@ -972,7 +1008,7 @@ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 int KYTY_SYSV_ABI PadResetLightBar(int handle) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 
@@ -982,7 +1018,7 @@ int KYTY_SYSV_ABI PadResetLightBar(int handle) {
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 	if (param == nullptr) {
@@ -997,7 +1033,7 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param) {
 	PRINT_NAME();
 
-	if (handle != 1) {
+	if (!PadIsOpenHandle(handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 	if (param == nullptr) {

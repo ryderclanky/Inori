@@ -49,6 +49,8 @@ constexpr int      VIDEO_OUT_FALSE                                      = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
+// Headset hangs off its own bus; numbering does not continue 0..2.
+constexpr int      VIDEO_OUT_BUS_TYPE_VR                                = 32;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
 constexpr int      VIDEO_OUT_FLIP_MODE_SLAVE                            = 8;
@@ -60,6 +62,10 @@ constexpr size_t   VIDEO_OUT_FLIP_QUEUE_CAPACITY                        = 16;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX                   = 4;
 constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_DEFAULT                        = 0x0000000000000001ULL;
 constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_119_88HZ                       = 0x000000000000000FULL;
+// OR-ed onto a base mode when the port drives the headset.
+constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_VR                             = 0x0000000000020000ULL;
+// Headset base mode used by titles such as Red Matter / Beat Saber (with VR bit).
+constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_HEADSET                        = 0x000000000000000CULL;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ                       = 3;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
@@ -250,8 +256,11 @@ private:
 struct VideoOutDriver::Impl {
 public:
 	static constexpr std::array VIDEO_OUT_BUSES {
-	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB};
-	static constexpr int VIDEO_OUT_NUM_MAX = VIDEO_OUT_BUSES.size() + 1;
+	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB,
+	    VIDEO_OUT_BUS_TYPE_VR};
+	static constexpr int VIDEO_OUT_NUM_MAX   = VIDEO_OUT_BUSES.size() + 1;
+	// Dense slot for bus 32 (last entry in VIDEO_OUT_BUSES).
+	static constexpr int VIDEO_OUT_VR_HANDLE = static_cast<int>(VIDEO_OUT_BUSES.size());
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
 	    : m_renderer(presenter.Renderer()), m_presenter(presenter), m_flip_queue(presenter) {
@@ -523,6 +532,12 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	}
 	if (!IsValidBufferIndex(index)) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
+	}
+
+	// Headset flips: buffers are GPU image descriptors the presenter cannot read, and there is
+	// no panel. Complete as blank so the title does not stall waiting for the flip.
+	if (handle == VideoOutDriver::Impl::VIDEO_OUT_VR_HANDLE) {
+		index = VIDEO_OUT_BUFFER_INDEX_BLANK;
 	}
 
 	Common::LockGuard lock(video_out->mutex);
@@ -1311,8 +1326,11 @@ KYTY_SYSV_ABI void VideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* at
 KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
-	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
+	LOGF("VideoOutOpen: user_id = %d, bus_type = %d, index = %d, param = 0x%016" PRIx64 "\n",
+	     user_id, bus_type, index, reinterpret_cast<uint64_t>(param));
+
+	// System (255) and init (0) are the documented IDs; titles also open with the signed-in user.
+	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0 && user_id != 1000);
 
 	return DriverState().Open(bus_type, index);
 }
@@ -1626,13 +1644,20 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 
 void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	auto* cfg = m_impl->Get(handle);
-	EXIT_IF(cfg == nullptr);
+	if (cfg == nullptr) {
+		LOGF("WaitForSubmitSlot: invalid video-out handle %d (ignored)\n", handle);
+		return;
+	}
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
 void VideoOutDriver::WaitFlipDone(int handle, int index) {
 	auto* ctx = m_impl->Get(handle);
-	EXIT_IF(ctx == nullptr);
+	if (ctx == nullptr) {
+		// Titles sometimes pass a failed VideoOutOpen error code as the handle (e.g. 0x80290001).
+		LOGF("WaitFlipDone: invalid video-out handle %d index %d (ignored)\n", handle, index);
+		return;
+	}
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
 	m_impl->GetFlipQueue().Wait(*ctx, index);
@@ -1864,7 +1889,19 @@ static int ValidateOutputConfig(int handle, uint64_t mode, const VideoOutOutputO
 		}
 	}
 
-	if (mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT && mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
+	// VR bit is OR-ed onto a base mode. Port always opens (titles treat Open errors as handles),
+	// so --vr gates Configure/IsOutputSupported: refuse VR modes when VR is off so flat titles
+	// can give up on the headset path.
+	const bool     vr        = ((mode & VIDEO_OUT_OUTPUT_MODE_VR) != 0);
+	const uint64_t base_mode = (mode & ~VIDEO_OUT_OUTPUT_MODE_VR);
+
+	if (vr && !Config::VrEnabled()) {
+		return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
+	}
+
+	if (base_mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT &&
+	    base_mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ &&
+	    !(vr && base_mode == VIDEO_OUT_OUTPUT_MODE_HEADSET)) {
 		return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
 	}
 
@@ -1893,6 +1930,11 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 	int result = ValidateOutputConfig(handle, mode, options, reserved_ptr, reserved);
 	if (result != OK) {
 		return result;
+	}
+
+	// Headset runs its own panel rate; do not require the window vblank frequency.
+	if ((mode & VIDEO_OUT_OUTPUT_MODE_VR) != 0) {
+		return VIDEO_OUT_TRUE;
 	}
 
 	if (mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) {

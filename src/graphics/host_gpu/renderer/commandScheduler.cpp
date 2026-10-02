@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -345,6 +347,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	m_context.GetOcclusionQueries().CloseForSubmit();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
@@ -394,6 +397,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 void CommandScheduler::BeginNext() {
 	CheckActive();
 	BeginCommand();
+	m_context.GetOcclusionQueries().ResumeAfterSubmit();
 }
 
 } // namespace Libs::Graphics

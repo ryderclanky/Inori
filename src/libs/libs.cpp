@@ -62,6 +62,10 @@ namespace LibRazorCpu {
 LIB_DEFINE(InitRazorCpu_1);
 } // namespace LibRazorCpu
 
+namespace LibVrTracker2 {
+LIB_DEFINE(InitVrTracker2_1);
+} // namespace LibVrTracker2
+
 namespace Fiber {
 LIB_DEFINE(InitFiber_1);
 } // namespace Fiber
@@ -121,6 +125,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitFontFt_1(s);
 	InitAgcDriver_1(s);
 	InitHmd2_1(s);
+	LibVrTracker2::InitVrTracker2_1(s);
 	InitLibKernel_1(s);
 	LibMouse::InitMouse_1(s);
 	LibKeyboard::InitKeyboard_1(s);

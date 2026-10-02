@@ -408,23 +408,186 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const auto destination_height =
 	    std::max(backing.extent.height >> destination_range.base_level, 1u);
 	const bool copy = source.backing.samples == 1;
-	EXIT_IF(layers == 0 || info.extent.width > source_width || info.extent.height > source_height ||
-	        info.extent.width > destination_width || info.extent.height > destination_height ||
-	        (copy ? !ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
-	              : source.backing.format != backing.format));
+	const auto info_width  = std::max(info.extent.width >> destination_range.base_level, 1u);
+	const auto info_height = std::max(info.extent.height >> destination_range.base_level, 1u);
+	const auto resolve_width  = std::min({info_width, source_width, destination_width});
+	const auto resolve_height = std::min({info_height, source_height, destination_height});
+	const bool formats_compatible =
+	    copy ? ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
+	         : source.backing.format == backing.format;
+	const bool size_clamped =
+	    resolve_width < info_width || resolve_height < info_height ||
+	    info.extent.width > source_width || info.extent.height > source_height ||
+	    info.extent.width > destination_width || info.extent.height > destination_height;
+	if (layers == 0 || resolve_width == 0 || resolve_height == 0) {
+		static std::atomic_flag warned_empty = ATOMIC_FLAG_INIT;
+		if (!warned_empty.test_and_set(std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: Image::Resolve skipped empty region: layers={} "
+			    "src={}x{}@mip{} layer{} samples={} fmt={} dst={}x{}@mip{} layer{} "
+			    "samples={} fmt={} info={}x{}\n",
+			    layers, source_width, source_height, source_range.base_level,
+			    source_range.base_layer, source.backing.samples,
+			    vk::to_string(source.backing.format), destination_width, destination_height,
+			    destination_range.base_level, destination_range.base_layer, backing.samples,
+			    vk::to_string(backing.format), info.extent.width, info.extent.height));
+		}
+		return;
+	}
+	if (size_clamped || !formats_compatible) {
+		static std::atomic_flag warned_mismatch = ATOMIC_FLAG_INIT;
+		if (!warned_mismatch.test_and_set(std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: Image::Resolve size/format note: size_clamped={} formats_ok={} "
+			    "copy={} resolve={}x{} src={}x{}@mip{} layer{}/{} samples={} fmt={} "
+			    "dst={}x{}@mip{} layer{}/{} samples={} fmt={} info={}x{} "
+			    "src_guest={}x{}\n",
+			    size_clamped, formats_compatible, copy, resolve_width, resolve_height,
+			    source_width, source_height, source_range.base_level, source_range.base_layer,
+			    source.backing.layers, source.backing.samples, vk::to_string(source.backing.format),
+			    destination_width, destination_height, destination_range.base_level,
+			    destination_range.base_layer, backing.layers, backing.samples,
+			    vk::to_string(backing.format), info.extent.width, info.extent.height,
+			    source.info.extent.width, source.info.extent.height));
+		}
+	}
 	auto resolved_source_range             = source_range;
 	auto resolved_destination_range        = destination_range;
 	resolved_source_range.layer_count      = layers;
 	resolved_destination_range.layer_count = layers;
-	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
+	const vk::Extent3D resolve_extent {resolve_width, resolve_height, 1};
+
+	// MSAA vkCmdResolveImage requires identical formats. When formats differ,
+	// resolve into a same-format single-sample intermediate, then blit to convert.
+	// The intermediate is destroyed only after the current scheduler tick so the
+	// GPU still owns it during submit (same-frame destroy previously DeviceLost).
+	VulkanImage* intermediate = nullptr;
+	if (!formats_compatible && !copy) {
+		const auto src_props = m_graphics.GetFormatProperties(source.backing.format);
+		const auto dst_props = m_graphics.GetFormatProperties(backing.format);
+		const bool can_blit =
+		    static_cast<bool>(src_props.optimalTilingFeatures &
+		                      vk::FormatFeatureFlagBits::eBlitSrc) &&
+		    static_cast<bool>(dst_props.optimalTilingFeatures &
+		                      vk::FormatFeatureFlagBits::eBlitDst);
+		if (!can_blit) {
+			static std::atomic_flag warned_noblit = ATOMIC_FLAG_INIT;
+			if (!warned_noblit.test_and_set(std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: Image::Resolve MSAA format mismatch without blit support; "
+				    "soft-skip src={} dst={}\n",
+				    vk::to_string(source.backing.format), vk::to_string(backing.format)));
+			}
+			return;
+		}
+		intermediate = new VulkanImage();
+		vk::ImageCreateInfo create {};
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = resolve_extent;
+		create.mipLevels     = 1;
+		create.arrayLayers   = layers;
+		create.format        = source.backing.format;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage =
+		    vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+		create.samples = vk::SampleCountFlagBits::e1;
+		if (!m_graphics.CreateImage(create, *intermediate)) {
+			delete intermediate;
+			intermediate = nullptr;
+			static std::atomic_flag warned_alloc = ATOMIC_FLAG_INIT;
+			if (!warned_alloc.test_and_set(std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: Image::Resolve failed to allocate MSAA convert intermediate "
+				    "{}x{} layers={} fmt={}; soft-skip\n",
+				    resolve_width, resolve_height, layers,
+				    vk::to_string(source.backing.format)));
+			}
+			return;
+		}
+		static std::atomic_flag warned_adapt = ATOMIC_FLAG_INIT;
+		if (!warned_adapt.test_and_set(std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Image::Resolve: deferred MSAA resolve+blit convert {} -> {} ({}x{}, "
+			    "layers={}, samples={})\n",
+			    vk::to_string(source.backing.format), vk::to_string(backing.format),
+			    resolve_width, resolve_height, layers, source.backing.samples));
+		}
+	}
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               resolved_source_range, command);
+
+	auto transit_raw = [](VulkanImage& img, vk::ImageLayout new_layout,
+	                      vk::AccessFlags2 new_access, uint32_t layer_count,
+	                      vk::CommandBuffer cmd) {
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask                    = img.state.pl_stage;
+		barrier.srcAccessMask                   = img.state.access_mask;
+		barrier.dstStageMask                    = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask                   = new_access;
+		barrier.oldLayout                       = img.state.layout;
+		barrier.newLayout                       = new_layout;
+		barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image                           = img.image;
+		barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		barrier.subresourceRange.baseMipLevel   = 0;
+		barrier.subresourceRange.levelCount     = 1;
+		barrier.subresourceRange.baseArrayLayer = 0;
+		barrier.subresourceRange.layerCount     = layer_count;
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		cmd.pipelineBarrier2(dependency);
+		img.state = {vk::PipelineStageFlagBits2::eTransfer, new_access, new_layout};
+	};
+
+	if (intermediate != nullptr) {
+		transit_raw(*intermediate, vk::ImageLayout::eTransferDstOptimal,
+		            vk::AccessFlagBits2::eTransferWrite, layers, command);
+		vk::ImageResolve resolve_region {};
+		resolve_region.srcSubresource = {vk::ImageAspectFlagBits::eColor,
+		                                 resolved_source_range.base_level,
+		                                 resolved_source_range.base_layer, layers};
+		resolve_region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
+		resolve_region.extent         = resolve_extent;
+		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                     intermediate->image, vk::ImageLayout::eTransferDstOptimal,
+		                     resolve_region);
+
+		transit_raw(*intermediate, vk::ImageLayout::eTransferSrcOptimal,
+		            vk::AccessFlagBits2::eTransferRead, layers, command);
+		Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+		        resolved_destination_range, command);
+
+		vk::ImageBlit blit_region {};
+		blit_region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
+		blit_region.dstSubresource = {vk::ImageAspectFlagBits::eColor,
+		                             resolved_destination_range.base_level,
+		                             resolved_destination_range.base_layer, layers};
+		blit_region.srcOffsets[0]  = vk::Offset3D {0, 0, 0};
+		blit_region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(resolve_width),
+		                                          static_cast<int32_t>(resolve_height), 1};
+		blit_region.dstOffsets[0]  = vk::Offset3D {0, 0, 0};
+		blit_region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(resolve_width),
+		                                          static_cast<int32_t>(resolve_height), 1};
+		command.blitImage(intermediate->image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+		                  vk::ImageLayout::eTransferDstOptimal, blit_region, vk::Filter::eNearest);
+
+		auto* graphics = &m_graphics;
+		m_scheduler.DeferOperation([graphics, intermediate] {
+			graphics->DeleteImage(*intermediate);
+			delete intermediate;
+		});
+		return;
+	}
+
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 	        resolved_destination_range, command);
-	if (copy) {
+	if (copy && formats_compatible) {
 		vk::ImageCopy region {};
 		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,
 		                         resolved_source_range.base_layer, layers};
@@ -434,6 +597,21 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		region.extent         = resolve_extent;
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 		                  vk::ImageLayout::eTransferDstOptimal, region);
+	} else if (copy) {
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,
+		                         resolved_source_range.base_layer, layers};
+		region.dstSubresource = {vk::ImageAspectFlagBits::eColor,
+		                         resolved_destination_range.base_level,
+		                         resolved_destination_range.base_layer, layers};
+		region.srcOffsets[0]  = vk::Offset3D {0, 0, 0};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(resolve_width),
+		                                      static_cast<int32_t>(resolve_height), 1};
+		region.dstOffsets[0]  = vk::Offset3D {0, 0, 0};
+		region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(resolve_width),
+		                                      static_cast<int32_t>(resolve_height), 1};
+		command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+		                  vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
 	} else {
 		vk::ImageResolve region {};
 		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,

@@ -940,7 +940,14 @@ void Presenter::Present(Frame& frame) {
 void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
-		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
+		// Host window only composites MAIN/OVERLAY (slots 0..layers.size()-1). VR bus 32 and
+		// other aux buses still flip for guest timing, but have no panel here: drop the frame.
+		if (layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size())) {
+			if (layer.frame != nullptr) {
+				m_impl->frames.Release(layer.frame);
+			}
+			continue;
+		}
 		m_impl->frames.ValidateForPresent(layer.frame);
 		auto& previous = m_impl->layers[layer.bus];
 		if (previous.frame != nullptr) {

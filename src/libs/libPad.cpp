@@ -89,7 +89,7 @@ PadDeviceClassGetExtendedInformation(int handle, PadDeviceClassExtendedInformati
 	constexpr int pad_error_invalid_handle = -2137915389; /* 0x80920003 */
 	constexpr int pad_error_invalid_arg    = -2137915391; /* 0x80920001 */
 
-	if (handle != 1) {
+	if (handle != 1 && handle != 2 && handle != 3) {
 		return pad_error_invalid_handle;
 	}
 	if (info == nullptr) {
@@ -113,7 +113,7 @@ static int KYTY_SYSV_ABI PadDeviceClassParseData(int handle, const Controller::P
 	     "\t class_data = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(data), reinterpret_cast<uint64_t>(class_data));
 
-	if (handle != 1) {
+	if (handle != 1 && handle != 2 && handle != 3) {
 		return pad_error_invalid_handle;
 	}
 	if (data == nullptr || class_data == nullptr) {
@@ -163,7 +163,8 @@ static int KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const 
 	     "\t param   = 0x%016" PRIx64 "\n",
 	     user_id, type, index, reinterpret_cast<uint64_t>(param));
 
-	return OK;
+	// Same open path as scePadOpen so Sense types get real handles (not 0).
+	return Controller::PadOpen(user_id, type, index, param);
 }
 
 // PPSA02385

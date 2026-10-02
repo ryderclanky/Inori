@@ -11,6 +11,7 @@
 
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string_view>
 #include <vector>
@@ -76,13 +77,16 @@ static void PrintUsage() {
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
+	::printf("  --trace                              Raise printf logging to File (for stub/opcode traces).\n");
+	::printf("                                       Env: KYTY_TRACE=1, KYTY_PRINTF_DIRECTION, KYTY_PRINTF_OUTPUT_FILE.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone                            Protect the guest SysV red zone (default on).\n");
+	::printf("  --no-redzone                         Disable guest SysV red zone protection.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -181,6 +185,27 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 	return true;
 }
 
+
+// Env defaults applied before CLI so flags win. KYTY_TRACE=1 forces File logging.
+static void ApplyTraceEnvDefaults(Config::ConfigOptions& cfg) {
+	if (const char* env = std::getenv("KYTY_PRINTF_DIRECTION")) {
+		Config::LogDirection dir {};
+		if (ParseEnum(std::string(env), dir)) {
+			cfg.printf_direction = dir;
+		}
+	}
+	if (const char* env = std::getenv("KYTY_PRINTF_OUTPUT_FILE")) {
+		if (env[0] != '\0') {
+			cfg.printf_output_file = Common::PathFromUtf8(env);
+		}
+	}
+	if (const char* env = std::getenv("KYTY_TRACE")) {
+		if (env[0] != '\0' && !(env[0] == '0' && env[1] == '\0')) {
+			cfg.printf_direction = Config::LogDirection::File;
+		}
+	}
+}
+
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
 
@@ -228,9 +253,19 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--trace") {
+			options.config.printf_direction = Config::LogDirection::File;
+			continue;
+		}
+
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
 			options.config.red_zone_protection_enabled = true;
+			continue;
+		}
+		if (arg == "--no-redzone") {
+			options.config.red_zone_protection_enabled = false;
 			continue;
 		}
 #endif
@@ -426,6 +461,8 @@ static int Main(int argc, char* argv[]) {
 
 	RunOptions options;
 	bool       show_help = false;
+
+	ApplyTraceEnvDefaults(options.config);
 
 	if (argc < 2) {
 		PrintUsage();

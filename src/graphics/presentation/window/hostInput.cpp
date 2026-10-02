@@ -199,6 +199,14 @@ void SetButton(uint32_t button, bool down) {
 	}
 }
 
+// Beat Saber VR Continue / Unity UI: Cross confirm + R2 as Sense trigger click.
+void SetUiConfirm(bool down) {
+	Controller::SetButton(Controller::HOST_INPUT_CONTROLLER_ID, Controller::PAD_BUTTON_CROSS, down);
+	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerRight,
+	                    down ? 255 : 0);
+	Controller::SetButton(Controller::HOST_INPUT_CONTROLLER_ID, Controller::PAD_BUTTON_R2, down);
+}
+
 void SetTouchPad(float x, bool down) {
 	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
 }
@@ -210,6 +218,7 @@ uint32_t DefaultKeyboardButton(int key_code) {
 		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
 		case SDLK_J: return Controller::PAD_BUTTON_CROSS;
+		case SDLK_SPACE: return Controller::PAD_BUTTON_CROSS; // Continue / UI select
 		case SDLK_I: return Controller::PAD_BUTTON_TRIANGLE;
 		case SDLK_K: return Controller::PAD_BUTTON_SQUARE;
 		case SDLK_L: return Controller::PAD_BUTTON_CIRCLE;
@@ -220,7 +229,7 @@ uint32_t DefaultKeyboardButton(int key_code) {
 		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
 		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
 		case SDLK_RETURN:
-		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;
+		case SDLK_RETURN2: return Controller::PAD_BUTTON_CROSS; // UI confirm (was Options)
 		default: return 0;
 	}
 }
@@ -312,6 +321,12 @@ void DefaultKeyboardInput(int key_code, bool down) {
 			right.down = down;
 			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
 			return;
+		case SDLK_SPACE:
+		case SDLK_RETURN:
+		case SDLK_RETURN2:
+		case SDLK_J:
+			SetUiConfirm(down);
+			return;
 		default: SetButton(DefaultKeyboardButton(key_code), down); return;
 	}
 }
@@ -390,6 +405,11 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
 		SetControl(map.FindMouseButton(mouse_button), down);
+		return;
+	}
+	// Default: left click = Cross + R2 (Sense trigger) for Unity Continue.
+	if (mouse_button == SDL_BUTTON_LEFT) {
+		SetUiConfirm(down);
 	}
 }
 

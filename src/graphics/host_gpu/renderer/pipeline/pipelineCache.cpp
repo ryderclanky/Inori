@@ -439,9 +439,12 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
+	// Dirty trees used to skip the driver cache entirely, which made every Stray/local
+	// play session pay full PSO compile cost. Signature still embeds KYTY_GIT_REVISION
+	// (including "-dirty"), and Vulkan keys PSOs on SPIR-V content, so enabling here is
+	// safe for local playtesting; stale entries are just wasted space.
 	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
+		PipelineCacheLog("Vulkan pipeline cache: enabling despite dirty build");
 	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
