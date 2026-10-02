@@ -1,4 +1,4 @@
-﻿# Inori
+# Inori
 
 A PlayStation 5 emulator fork. Two equal goals: get more games running, and get PSVR2 games onto ordinary PC VR headsets.
 
@@ -21,6 +21,17 @@ Right now this is early. Expect crashes, missing HLE, and lots of logging while 
 Active local development. Upstream KytyPS5 already boots many 2D and some 3D titles. Our fork adds compatibility work on top (for example red-zone / Windows ABI fixes and game-specific HLE). PSVR2 / OpenXR work is underway as a peer track, not a side quest.
 
 For general KytyPS5 game reports, see the [community compatibility list](https://kytyps5.github.io/).
+
+
+## Screenshots
+
+### Beat Saber (PSVR2)
+
+Reached the in-game Continue screen on the Desktop build of this fork (title id PPSA15035). Visuals look good; further progress needs a connected VR session for Sense input.
+
+<p align="center">
+  <img src="docs/screenshots/beatsaber-continue.png" width="720" alt="Beat Saber Continue screen running in Inori">
+</p>
 
 ## Credits
 
