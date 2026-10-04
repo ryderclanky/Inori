@@ -10,13 +10,17 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/shader/shaderBindings.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -25,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -70,6 +75,8 @@ constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ                       = 3;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED       = 1;
+// PSVR2 scanout. The registered data pointer addresses an object, not pixels.
+constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET          = 16;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY = 8;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED = 32;
 
@@ -171,6 +178,8 @@ struct VideoOutBuffer {
 	int      group_index      = -1;
 	uint64_t data_address     = 0;
 	uint64_t metadata_address = 0;
+	// Category 16 resolved this slot to an Agc color base in direct GPU memory.
+	bool     gpu_color        = false;
 
 	[[nodiscard]] bool Occupied() const noexcept { return group_index >= 0; }
 };
@@ -180,7 +189,14 @@ struct BufferAttributeGroup {
 	int                      category = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED;
 	bool                     occupied = false;
 
-	[[nodiscard]] Graphics::ImageInfo ImageInfo(const VideoOutBuffer& buffer) const;
+	enum class SurfaceError { None, InvalidValue, InvalidAddress };
+
+	struct DecodedSurface {
+		SurfaceError        error = SurfaceError::None;
+		Graphics::ImageInfo info {};
+	};
+
+	[[nodiscard]] DecodedSurface Decode(const VideoOutBuffer& buffer) const;
 };
 
 struct VideoOutConfig {
@@ -534,13 +550,17 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 
-	// Headset flips: buffers are GPU image descriptors the presenter cannot read, and there is
-	// no panel. Complete as blank so the title does not stall waiting for the flip.
-	if (handle == VideoOutDriver::Impl::VIDEO_OUT_VR_HANDLE) {
-		index = VIDEO_OUT_BUFFER_INDEX_BLANK;
-	}
-
 	Common::LockGuard lock(video_out->mutex);
+	// Headset flips have no panel. A registered direct-GPU color base is presented. Anything
+	// else completes as blank so the title does not stall, and the MAIN image stays up.
+	if (handle == VideoOutDriver::Impl::VIDEO_OUT_VR_HANDLE) {
+		const bool registered_color = index >= 0 && index < VIDEO_OUT_BUFFER_NUM_MAX &&
+		                              video_out->buffers[index].gpu_color &&
+		                              video_out->buffers[index].Occupied();
+		if (!registered_color) {
+			index = VIDEO_OUT_BUFFER_INDEX_BLANK;
+		}
+	}
 	if ((video_out->master != nullptr) != (flip_mode == VIDEO_OUT_FLIP_MODE_SLAVE) ||
 	    (video_out->slave_count != 0) != (flip_mode == VIDEO_OUT_FLIP_MODE_MASTER)) {
 		return VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
@@ -555,23 +575,78 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	return OK;
 }
 
-Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
-	const auto compression = Graphics::ClassifyVideoOutCompression(
+static int SurfaceErrorCode(BufferAttributeGroup::SurfaceError error) {
+	switch (error) {
+		case BufferAttributeGroup::SurfaceError::None: return OK;
+		case BufferAttributeGroup::SurfaceError::InvalidAddress:
+			return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+		case BufferAttributeGroup::SurfaceError::InvalidValue: return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	return VIDEO_OUT_ERROR_INVALID_VALUE;
+}
+
+BufferAttributeGroup::DecodedSurface
+BufferAttributeGroup::Decode(const VideoOutBuffer& buffer) const {
+	const auto fail = [](SurfaceError error) {
+		DecodedSurface decoded {};
+		decoded.error = error;
+		return decoded;
+	};
+	auto compression = Graphics::ClassifyVideoOutCompression(
 	    category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, buffer.metadata_address,
 	    attribute.dcc_control, attribute.dcc_cb_register_clear_color);
+	constexpr uint32_t kDcc256_256_0 = 0x00000048u;
+	constexpr uint32_t kDcc256_64_64 = 0x00000208u;
+	const bool         unrecognized_dcc =
+	    attribute.dcc_control != 0 && attribute.dcc_control != kDcc256_256_0 &&
+	    attribute.dcc_control != kDcc256_64_64;
+	const bool headset = category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET;
+	// Category 16 metadata is part of the registered object, not a scanout DCC plane.
+	if (headset) {
+		if (attribute.dcc_control != 0 || buffer.metadata_address != 0) {
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("VideoOut: category 16 ignores DCC control 0x%08" PRIx32
+				     " metadata=0x%016" PRIx64
+				     "; presenting color bytes or the native image\n",
+				     attribute.dcc_control, buffer.metadata_address);
+			}
+		}
+		compression = Graphics::VideoOutCompression::Uncompressed;
+	} else if (unrecognized_dcc) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("VideoOut: unrecognized DCC control 0x%08" PRIx32
+			     "; presenting color bytes or the native image\n",
+			     attribute.dcc_control);
+		}
+		compression = Graphics::VideoOutCompression::Uncompressed;
+	} else if (compression == Graphics::VideoOutCompression::Unsupported) {
+		return fail(SurfaceError::InvalidValue);
+	}
 	if (attribute.reserved0 != 0 || attribute.aspect_ratio != 0 || attribute.width == 0 ||
 	    attribute.height == 0 || attribute.width > 16384 || attribute.height > 16384 ||
-	    attribute.pitch_in_pixel != 0 ||
 	    (attribute.option & ~(VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY |
 	                          VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED)) != 0 ||
 	    attribute.tiling_mode != 0 || attribute.pad0 != 0 || attribute.reserved1[0] != 0 ||
-	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
-	    compression == Graphics::VideoOutCompression::Unsupported) {
-		EXIT("unsupported or invalid video-out surface attributes\n");
+	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0) {
+		return fail(SurfaceError::InvalidValue);
+	}
+	if (buffer.data_address == 0) {
+		return fail(SurfaceError::InvalidAddress);
 	}
 	Graphics::VideoOutPixelFormatInfo pixel_format {};
+	bool                              relaxed = unrecognized_dcc || headset;
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
-		EXIT("unsupported video-out pixel format: 0x%016" PRIx64 "\n", attribute.pixel_format);
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("VideoOut: pixel format 0x%016" PRIx64
+			     " is outside the known set; presenting color bytes or the native image\n",
+			     attribute.pixel_format);
+		}
+		pixel_format = {vk::Format::eR8G8B8A8Srgb, Graphics::Prospero::BufferFormat::k8_8_8_8Srgb, 4,
+		                false};
+		relaxed      = true;
 	}
 	if (attribute.pixel_format == Graphics::VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -582,14 +657,30 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 		}
 	}
 	const auto tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
-	const auto pitch =
+	const auto computed_pitch =
 	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, tile_mode);
+	if (computed_pitch == 0 ||
+	    (attribute.pitch_in_pixel != 0 && attribute.pitch_in_pixel != computed_pitch)) {
+		return fail(SurfaceError::InvalidValue);
+	}
+	const auto pitch = computed_pitch;
 	Graphics::TileSizeAlign total {};
 	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
 	                                  1, 1, tile_mode, false, total);
-	if (total.size == 0 || total.align != 65536 ||
-	    (buffer.data_address & (total.align - 1u)) != 0) {
-		EXIT("invalid video-out surface footprint or alignment\n");
+	const bool scanout_aligned =
+	    total.align == 65536 && (buffer.data_address & (static_cast<uint64_t>(total.align) - 1u)) == 0;
+	if (total.size == 0 || total.align == 0) {
+		return fail(SurfaceError::InvalidValue);
+	}
+	if (headset) {
+		if (!LibKernel::Memory::IsDirectGpuRange(buffer.data_address, total.size)) {
+			return fail(SurfaceError::InvalidAddress);
+		}
+	} else if (!scanout_aligned) {
+		return fail(SurfaceError::InvalidAddress);
+	}
+	if (!LibKernel::Memory::IsCommittedGuestRange(buffer.data_address, total.size)) {
+		return fail(SurfaceError::InvalidAddress);
 	}
 	Graphics::ImageInfo info {};
 	info.data            = {buffer.data_address, total.size};
@@ -603,12 +694,16 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	info.samples         = 1;
 	info.tile_mode       = tile_mode;
 	info.bgra16          = pixel_format.bgra16;
+	info.scanout_relaxed = relaxed;
 	info.mip_layout[0]   = {0, total.size, pitch, attribute.height};
 	if (compression != Graphics::VideoOutCompression::Uncompressed) {
 		Graphics::TileSizeAlign dcc_size {};
 		if (!Graphics::TileGetDccSize(attribute.width, attribute.height, 1,
 		                              pixel_format.bytes_per_element, 1, tile_mode, dcc_size)) {
-			EXIT("invalid video-out DCC footprint\n");
+			return fail(SurfaceError::InvalidValue);
+		}
+		if (!LibKernel::Memory::IsCommittedGuestRange(buffer.metadata_address, dcc_size.size)) {
+			return fail(SurfaceError::InvalidAddress);
 		}
 		info.metadata.range       = {buffer.metadata_address, dcc_size.size};
 		info.metadata.kind        = Graphics::ImageMetadataKind::Dcc;
@@ -617,9 +712,9 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	}
 	Graphics::ImageOps::Validate(info);
 	if (!Graphics::IsSupportedVideoOutFormat(info)) {
-		EXIT("unsupported normalized video-out format\n");
+		return fail(SurfaceError::InvalidValue);
 	}
-	return info;
+	return {SurfaceError::None, info};
 }
 
 VideoOutDriver::VideoOutDriver(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
@@ -1086,7 +1181,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		index          = request->index;
 	}
 
-	const bool          special = IsSpecialBufferIndex(index);
+	bool                special = IsSpecialBufferIndex(index);
 	Graphics::ImageInfo source_info;
 	uint32_t            width   = 0;
 	uint32_t            height  = 0;
@@ -1112,7 +1207,20 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 					     " index=%d group=%d\n",
 					     request_id, index, surface.group_index);
 				}
-				source_info = cfg->groups[surface.group_index].ImageInfo(surface);
+				const auto decoded = cfg->groups[surface.group_index].Decode(surface);
+				if (decoded.error != BufferAttributeGroup::SurfaceError::None) {
+					static std::atomic_bool logged {false};
+					if (!logged.exchange(true, std::memory_order_relaxed)) {
+						LOGF("VideoOut: refusing to upload an unpublished or unmapped scanout "
+						     "index=%d\n",
+						     index);
+					}
+					width  = cfg->width;
+					height = cfg->height;
+					special = true;
+				} else {
+					source_info = decoded.info;
+				}
 				premultiplied_alpha =
 				    (cfg->groups[surface.group_index].attribute.option &
 				     VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED) != 0;
@@ -1260,7 +1368,32 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
 		}
+		const bool mirror_color =
+		    r.cfg->bus == VIDEO_OUT_BUS_TYPE_VR && !IsSpecialBufferIndex(r.index) && r.index >= 0 &&
+		    r.index < VIDEO_OUT_BUFFER_NUM_MAX && r.cfg->buffers[r.index].gpu_color;
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
+		if (mirror_color) {
+			layers[i].bus = VIDEO_OUT_BUS_TYPE_MAIN;
+		}
+	}
+	bool mirrored = false;
+	for (size_t i = 0; i < count; i++) {
+		if (requests[i].cfg->bus == VIDEO_OUT_BUS_TYPE_VR &&
+		    layers[i].bus == VIDEO_OUT_BUS_TYPE_MAIN) {
+			mirrored = true;
+			break;
+		}
+	}
+	if (mirrored) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("VideoOut: mirroring a registered Hmd2 color target into the desktop window\n");
+		}
+		for (size_t i = 0; i < count; i++) {
+			if (requests[i].cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN) {
+				layers[i].bus = -1;
+			}
+		}
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
@@ -1431,6 +1564,208 @@ KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
+namespace {
+
+struct HeadsetCandidate {
+	uint64_t base  = 0;
+	int64_t  score = 0;
+	bool     found = false;
+};
+
+void ConsiderHeadsetBase(HeadsetCandidate& best, uint64_t base, int64_t score) {
+	if (!best.found || score > best.score) {
+		best.found = true;
+		best.base  = base;
+		best.score = score;
+	}
+}
+
+bool ReadCommittedGuest(uint64_t address, uint64_t size, void* out) {
+	return LibKernel::Memory::IsCommittedGuestRange(address, size) &&
+	       LibKernel::Memory::TryReadBacking(address, out, size);
+}
+
+bool ReadLargestPrefix(uint64_t address, uint8_t* storage, uint64_t capacity, uint64_t& out_size) {
+	static constexpr uint64_t k_sizes[] = {2048, 1024, 512, 256, 128, 64, 32};
+	for (const uint64_t size: k_sizes) {
+		if (size > capacity) {
+			continue;
+		}
+		if (ReadCommittedGuest(address, size, storage)) {
+			out_size = size;
+			return true;
+		}
+	}
+	return false;
+}
+
+void ScanHeadsetBlob(uint64_t object, const uint8_t* bytes, size_t size, uint32_t attr_width,
+                     uint32_t attr_height, HeadsetCandidate& best, bool chase) {
+	using Graphics::Prospero::ImageType;
+	using Graphics::Prospero::TileMode;
+	if (size >= sizeof(Graphics::ShaderTextureResource)) {
+		for (size_t off = 0; off + sizeof(Graphics::ShaderTextureResource) <= size; off += 8) {
+			Graphics::ShaderTextureResource desc {};
+			std::memcpy(&desc, bytes + off, sizeof(desc));
+			if (desc.IsNull()) {
+				continue;
+			}
+			const auto type = desc.Type();
+			if (type != ImageType::kColor2D && type != ImageType::kColor2DArray &&
+			    type != ImageType::kColor2DMsaa) {
+				continue;
+			}
+			const auto tile = desc.TileMode();
+			switch (tile) {
+				case TileMode::kLinear:
+				case TileMode::kStandard4KB:
+				case TileMode::kStandard64KB:
+				case TileMode::kDepth:
+				case TileMode::kRenderTarget: break;
+				default: continue;
+			}
+			if (Graphics::Prospero::NumBytesPerElement(desc.Format()) == 0) {
+				continue;
+			}
+			const uint32_t width  = static_cast<uint32_t>(desc.Width5()) + 1u;
+			const uint32_t height = static_cast<uint32_t>(desc.Height5()) + 1u;
+			if (width > 16384 || height > 16384) {
+				continue;
+			}
+			const uint64_t color_base = desc.Base40();
+			if (!LibKernel::Memory::IsDirectGpuRange(color_base, 256)) {
+				continue;
+			}
+			int64_t score = static_cast<int64_t>(width) * static_cast<int64_t>(height);
+			if (tile == TileMode::kRenderTarget) {
+				score += 1000000000;
+			}
+			if (tile == TileMode::kDepth) {
+				score -= 100000000;
+			}
+			if (width == attr_width && height == attr_height) {
+				score += 500000000;
+			}
+			ConsiderHeadsetBase(best, color_base, score);
+		}
+	}
+
+	auto pair_at = [bytes, size](size_t off, uint32_t& header, uint32_t& value) {
+		if (off + 8 > size) {
+			return false;
+		}
+		std::memcpy(&header, bytes + off, sizeof(header));
+		std::memcpy(&value, bytes + off + sizeof(header), sizeof(value));
+		return true;
+	};
+	for (size_t off = 0; off + 8 <= size; off += 4) {
+		uint32_t header = 0;
+		uint32_t value  = 0;
+		if (!pair_at(off, header, value) || (header & 0xffffu) != Graphics::Pm4::CB_COLOR0_BASE ||
+		    (header >> 16u) > 32u) {
+			continue;
+		}
+		uint64_t       color_base     = static_cast<uint64_t>(value) << 8u;
+		uint32_t       width          = 0;
+		uint32_t       height         = 0;
+		bool           sized          = false;
+		bool           have_ext       = false;
+		uint64_t       ext_bits       = 0;
+		uint64_t       best_ext_dist  = UINT64_MAX;
+		uint64_t       best_attr_dist = UINT64_MAX;
+		const size_t   window_begin   = off > 256 ? off - 256 : 0;
+		const size_t   window_end     = std::min(size, off + 256);
+		for (size_t pair = window_begin; pair + 8 <= window_end; pair += 4) {
+			uint32_t pair_header = 0;
+			uint32_t pair_value  = 0;
+			if (!pair_at(pair, pair_header, pair_value) || (pair_header >> 16u) > 32u ||
+			    pair == off) {
+				continue;
+			}
+			const uint32_t reg  = pair_header & 0xffffu;
+			const uint64_t dist = pair > off ? pair - off : off - pair;
+			if (reg == Graphics::Pm4::CB_COLOR0_BASE_EXT && dist < best_ext_dist) {
+				best_ext_dist = dist;
+				ext_bits      = (static_cast<uint64_t>(pair_value) & 0xffu) << 40u;
+				have_ext      = true;
+			} else if (reg == Graphics::Pm4::CB_COLOR0_ATTRIB2 && dist < best_attr_dist) {
+				best_attr_dist = dist;
+				height = (pair_value & Graphics::Pm4::CB_COLOR0_ATTRIB2_MIP0_HEIGHT_MASK) + 1u;
+				width  = ((pair_value >> Graphics::Pm4::CB_COLOR0_ATTRIB2_MIP0_WIDTH_SHIFT) &
+				          Graphics::Pm4::CB_COLOR0_ATTRIB2_MIP0_WIDTH_MASK) +
+				         1u;
+				sized = width <= 16384 && height <= 16384;
+			}
+		}
+		if (have_ext) {
+			color_base |= ext_bits;
+		}
+		if (!LibKernel::Memory::IsDirectGpuRange(color_base, 256)) {
+			continue;
+		}
+		int64_t score = 2;
+		if (sized) {
+			score = static_cast<int64_t>(width) * static_cast<int64_t>(height);
+			if (width == attr_width && height == attr_height) {
+				score += 500000000;
+			}
+		}
+		ConsiderHeadsetBase(best, color_base, score);
+	}
+
+	if (!chase || size < 8) {
+		return;
+	}
+	for (size_t off = 0; off + 8 <= size; off += 8) {
+		uint64_t ptr = 0;
+		std::memcpy(&ptr, bytes + off, sizeof(ptr));
+		if (ptr < 0x1000 || (ptr & 7u) != 0 || (ptr >= object && ptr < object + size)) {
+			continue;
+		}
+		uint8_t              nested[256] {};
+		static constexpr uint64_t k_nested[] = {256, 128, 64, 32};
+		uint64_t                  nested_size = 0;
+		bool                      read        = false;
+		for (const uint64_t nested_try: k_nested) {
+			if (ReadCommittedGuest(ptr, nested_try, nested)) {
+				nested_size = nested_try;
+				read        = true;
+				break;
+			}
+		}
+		if (!read) {
+			continue;
+		}
+		ScanHeadsetBlob(ptr, nested, static_cast<size_t>(nested_size), attr_width, attr_height,
+		                best, false);
+	}
+}
+
+// Category 16's data pointer addresses an object. The color base is an Agc texture or Cx color
+// descriptor inside that object, and it must sit in the direct GPU aperture (256-byte aligned).
+bool FindHeadsetColorBase(uint64_t object, const VideoOutBufferAttribute2& attribute,
+                          uint64_t& color_base) {
+	color_base = 0;
+	if (object == 0) {
+		return false;
+	}
+	uint8_t  storage[2048] {};
+	uint64_t size = 0;
+	if (!ReadLargestPrefix(object, storage, sizeof(storage), size)) {
+		return false;
+	}
+	HeadsetCandidate best {};
+	ScanHeadsetBlob(object, storage, static_cast<size_t>(size), attribute.width, attribute.height,
+	                best, true);
+	if (!best.found) {
+		return false;
+	}
+	color_base = best.base;
+	return true;
+}
+
+} // namespace
+
 KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer_index_start,
                                            const VideoOutBuffers* buffers, int buffer_num,
                                            const VideoOutBufferAttribute2* attribute, int category,
@@ -1476,7 +1811,8 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
 	if (category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED &&
-	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED) {
+	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED &&
+	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET) {
 		return VIDEO_OUT_ERROR_INVALID_CATEGORY;
 	}
 
@@ -1494,14 +1830,35 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 			LOGF("\t buffers[%d]: ignoring reserved fields {%p, %p}\n", i, buffers[i].reserved[0],
 			     buffers[i].reserved[1]);
 		}
-		const auto data_address     = reinterpret_cast<uint64_t>(buffers[i].data);
+		auto       data_address     = reinterpret_cast<uint64_t>(buffers[i].data);
 		const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
+		bool       gpu_color        = false;
+		if (category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HEADSET) {
+			uint64_t color_base = 0;
+			if (!FindHeadsetColorBase(data_address, *attribute, color_base)) {
+				static std::atomic_bool logged {false};
+				if (!logged.exchange(true, std::memory_order_relaxed)) {
+					LOGF("VideoOut: category 16 object 0x%016" PRIx64
+					     " has no direct-GPU color base; leaving the desktop image up\n",
+					     data_address);
+				}
+				return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+			}
+			LOGF("\t headset object 0x%016" PRIx64 " -> color base 0x%016" PRIx64 "\n", data_address,
+			     color_base);
+			data_address = color_base;
+			gpu_color    = true;
+		}
 		registrations.push_back({
 		    .group_index      = set_index,
 		    .data_address     = data_address,
 		    .metadata_address = metadata_address,
+		    .gpu_color        = gpu_color,
 		});
-		(void)group.ImageInfo(registrations.back());
+		const auto decoded = group.Decode(registrations.back());
+		if (decoded.error != BufferAttributeGroup::SurfaceError::None) {
+			return SurfaceErrorCode(decoded.error);
+		}
 	}
 
 	Common::LockGuard lock(ctx->mutex);
@@ -1563,7 +1920,10 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
 	};
 	for (const auto& buffer: ctx->buffers) {
 		if (buffer.group_index == set_index) {
-			(void)replacement.ImageInfo(buffer);
+			const auto decoded = replacement.Decode(buffer);
+			if (decoded.error != BufferAttributeGroup::SurfaceError::None) {
+				return SurfaceErrorCode(decoded.error);
+			}
 		}
 	}
 	ctx->groups[set_index] = replacement;

@@ -1374,6 +1374,38 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
+ImageId TextureCache::FindNativeScanout(uint64_t address) {
+	if (address == 0) {
+		return {};
+	}
+	std::scoped_lock lock {m_lock};
+	ImageId          best {};
+	uint64_t         best_area = 0;
+	bool             best_target = false;
+	for (const auto id: FindImagesInRegion(address, 256, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || image->info.data.address != address || image->info.IsDepth() ||
+		    image->info.pixel_format == vk::Format::eUndefined || image->info.samples != 1 ||
+		    image->backing.samples != 1 || image->backing.layers != 1) {
+			continue;
+		}
+		const bool native = (image->usage.render_target || image->IsGpuModified()) &&
+		                    !image->IsCpuDirty() && !image->IsBufferModified();
+		if (!native || image->backing.image == nullptr) {
+			continue;
+		}
+		const uint64_t area =
+		    static_cast<uint64_t>(image->info.extent.width) * image->info.extent.height;
+		const bool target = image->usage.render_target;
+		if (!best || (target && !best_target) || (target == best_target && area >= best_area)) {
+			best        = id;
+			best_area   = area;
+			best_target = target;
+		}
+	}
+	return best;
+}
+
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];

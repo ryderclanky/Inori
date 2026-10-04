@@ -891,6 +891,28 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool IsCommittedGuestRange(uint64_t address, uint64_t size) {
+	if (address == 0 || size == 0 || size > UINT64_MAX - address || g_virtual_ranges == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	return g_virtual_ranges->ClampRangeSize(address, size) == size;
+}
+
+bool IsDirectGpuRange(uint64_t address, uint64_t size) {
+	if (address == 0 || size == 0 || (address & 0xffu) != 0 || size > UINT64_MAX - address ||
+	    g_virtual_ranges == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	VirtualRanges::Range                  range {};
+	if (!g_virtual_ranges->Query(address, 0, &range) || range.type != VirtualRangeType::Direct) {
+		return false;
+	}
+	const uint64_t end = range.start + range.size;
+	return address >= range.start && size <= end - address;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
