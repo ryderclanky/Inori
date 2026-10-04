@@ -620,7 +620,7 @@ void MarkRedZoneAccess(DecodedCodeInstruction& decoded, const ZydisDecodedOperan
                        s64 rsp_relative_offset) {
 	const s64 access_size = std::max<s64>(operand.size / 8, 1);
 	const s64 range_start = std::max(rsp_relative_offset, -static_cast<s64>(GuestRedZoneSize));
-	const s64 range_end   = std::min(rsp_relative_offset + access_size, 0LL);
+	const s64 range_end   = std::min<s64>(rsp_relative_offset + access_size, 0);
 	if (range_start >= range_end) {
 		return;
 	}
