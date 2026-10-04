@@ -891,6 +891,13 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool IsGuestRangeMapped(uint64_t vaddr, uint64_t size) {
+	if (g_virtual_ranges == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+	return g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

@@ -865,7 +865,21 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 			ret.bind     = BindType::Local;
 			ret.dbg_name = Common::PathToString(program->file_name);
 			break;
-		default: EXIT("unknown type: %d\n", (int)type);
+		case R_X86_64_DTPOFF64:
+		case R_X86_64_TPOFF64: {
+			// TLS symbols carry an offset inside the module image, not a load address.
+			const auto sym           = symbols[symbol];
+			const auto symbol_offset = static_cast<int64_t>(sym.st_value) + addend;
+			const auto tcb_offset =
+			    program->tls.tcb_offset != 0 ? program->tls.tcb_offset : program->tls.image_size;
+			const auto from_tcb = static_cast<int64_t>(tcb_offset) - symbol_offset;
+			ret.value           = type == R_X86_64_DTPOFF64 ? static_cast<uint64_t>(symbol_offset)
+			                                                : static_cast<uint64_t>(-from_tcb);
+			ret.resolved        = true;
+			ret.bind            = BindType::Local;
+			ret.dbg_name        = Common::PathToString(program->file_name);
+		} break;
+		default: EXIT("unknown relocation type: %d\n", (int)type);
 	}
 
 	return ret;
@@ -878,18 +892,23 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	auto       value   = ri.value;
 	bool       stubbed = false;
 	if (!ri.resolved) {
-		const bool weak = ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
-		if (!weak) {
+		const bool failure_allowed =
+		    ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
+		if (failure_allowed) {
+			// Missing symbols are null. A thunk that returns 0, or a no-access
+			// page, both look like live addresses to the guest.
+			value = 0;
+		} else {
 			LOGF("Stubbed: %s\n",
 			     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
 			                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
 			                 ri.dbg_name).c_str());
-		}
-		if (ri.type == SymbolType::Object) {
-			value = g_invalid_memory;
-		} else {
-			value   = RegisterStubbedImport(index, program, ri);
-			stubbed = true;
+			if (ri.type == SymbolType::Object) {
+				value = g_invalid_memory;
+			} else {
+				value   = RegisterStubbedImport(index, program, ri);
+				stubbed = true;
+			}
 		}
 	}
 
