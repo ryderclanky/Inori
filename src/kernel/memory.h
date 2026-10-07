@@ -189,6 +189,12 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
+// True when [address, address+size) is one contiguous committed guest mapping. A reserved
+// gap or unmapped hole returns false and does not terminate the process.
+[[nodiscard]] bool IsCommittedGuestRange(uint64_t address, uint64_t size);
+// True when [address, address+size) sits in one direct GPU mapping and the base is 256-byte
+// aligned, which is the Agc color-target granularity. 64-byte alignment is not enough.
+[[nodiscard]] bool IsDirectGpuRange(uint64_t address, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestBeforeNextBackingMap(callback_func_t callback);

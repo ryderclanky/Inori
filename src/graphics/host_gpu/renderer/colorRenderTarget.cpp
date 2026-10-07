@@ -72,9 +72,19 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
+	if (samples == 0) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
+	}
+	// EQAA coverage samples are not a Vulkan sample count. Draw with the fragment count so
+	// edges fall back to ordinary MSAA instead of leaving the frame unrendered.
+	if (rt.attrib.num_samples != rt.attrib.num_fragments) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("RenderColorTarget: EQAA samples=%u fragments=%u; using the fragment count as "
+			     "the Vulkan sample count\n",
+			     rt.attrib.num_samples, rt.attrib.num_fragments);
+		}
 	}
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
 	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {
@@ -175,14 +185,25 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	const auto transfer_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
 	TileTextureBlockLayout texture_tile_layout {};
+	const bool             texture_metadata =
+	    rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
+	    rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
+	    rt.info.dcc_compression_enable || rt.cmask.addr != 0 || rt.fmask.addr != 0 ||
+	    rt.dcc_addr.addr != 0 || rt.dcc.data_write_on_dcc_clear_to_reg;
+	if (texture_tile && texture_metadata) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("RenderColorTarget: texture-tiled color target carries DCC, CMASK, or FMASK; "
+			     "drawing the expanded image (fast-clear may be wrong) addr=0x%016" PRIx64
+			     " tile=%u cmask=0x%016" PRIx64 " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
+			     rt.base.addr, static_cast<uint32_t>(rt.attrib3.tile_mode), rt.cmask.addr,
+			     rt.fmask.addr, rt.dcc_addr.addr);
+		}
+	}
 	if (texture_tile &&
 	    (!TileGetTextureBlockLayout(transfer_format, rt.attrib3.tile_mode, volume,
 	                                texture_tile_layout) ||
-	     (rt.base.addr & (texture_tile_layout.block.block_size - 1u)) != 0 ||
-	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
-	     rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
-	     rt.info.dcc_compression_enable || rt.cmask.addr != 0 || rt.fmask.addr != 0 ||
-	     rt.dcc_addr.addr != 0 || rt.dcc.data_write_on_dcc_clear_to_reg)) {
+	     (rt.base.addr & (texture_tile_layout.block.block_size - 1u)) != 0)) {
 		EXIT("unsupported texture-tiled render target: addr=0x%016" PRIx64 " tile=%u"
 		     " dimension=%u depth=%u levels=%u layer=%u/%u samples=%u fragments=%u bpe=%u"
 		     " cmask=0x%016" PRIx64 " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
@@ -283,15 +304,21 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		if (has_dcc) {
 			(void)TileGetDccSize(width, height, layers, bytes_per_element, levels,
 			                     rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments);
-			desc.info.metadata.dcc_alpha_msb = DccAlphaOnMsb(rt.info);
 		} else {
 			(void)TileGetCmaskSize(width, height, layers, levels, metadata_size);
 		}
-		// DCC owns the clear when both planes are enabled; single-sample CMASK stays expanded.
-		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
-		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
-		desc.info.metadata.clear_word           = rt.clear_word0.word0;
-		desc.info.metadata.clear_register_valid = true;
+		// Texture tiles have no DCC/CMASK footprint here. Keep the expanded color image; a
+		// missing fast-clear is preferable to refusing the draw.
+		if (metadata_size.size != 0) {
+			if (has_dcc) {
+				desc.info.metadata.dcc_alpha_msb = DccAlphaOnMsb(rt.info);
+			}
+			desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
+			desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr,
+			                            metadata_size.size};
+			desc.info.metadata.clear_word           = rt.clear_word0.word0;
+			desc.info.metadata.clear_register_valid = true;
+		}
 	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {

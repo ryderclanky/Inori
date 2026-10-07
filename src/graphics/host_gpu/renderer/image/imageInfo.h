@@ -70,6 +70,9 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
+	// Unrecognized scanout DCC or pixel format: present a native GPU image when one is current,
+	// otherwise the uncompressed color bytes. Never a guest DCC bit decoder.
+	bool                         scanout_relaxed = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
 
 	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {

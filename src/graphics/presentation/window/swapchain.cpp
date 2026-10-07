@@ -315,6 +315,18 @@ struct Presenter::Impl {
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
+		auto& cache = renderer.GetTextureCache();
+		// A GPU color target already holds the expanded pixels. Prefer it over re-reading guest
+		// bytes when the scanout DCC word or pixel format is outside the known set.
+		if (info.scanout_relaxed) {
+			if (const auto native = cache.FindNativeScanout(info.data.address)) {
+				auto& image           = cache.GetImage(native);
+				image.usage.video_out = true;
+				cache.UpdateImage(native);
+				return image;
+			}
+		}
+
 		TextureCache::ImageDesc desc {};
 		desc.info                  = info;
 		desc.view_info.format      = info.pixel_format;
@@ -327,7 +339,6 @@ struct Presenter::Impl {
 		desc.view_info.usage       = vk::ImageUsageFlagBits::eTransferSrc;
 		desc.type                  = TextureCache::BindingType::VideoOut;
 
-		auto&      cache      = renderer.GetTextureCache();
 		const auto image_id   = cache.FindImage(desc);
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
@@ -868,23 +879,27 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
+static vk::Format PresentationFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
+		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eB8G8R8A8Unorm;
+		default: return format;
+	}
+}
+
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
-	auto frame_format = info.pixel_format;
-	switch (frame_format) {
-		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
-		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
-		default: break;
-	}
-	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
+	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height},
+	                                    PresentationFormat(info.pixel_format));
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 	frame->Configure(m_impl->window.graphic_ctx,
-	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
+	                 {image.backing.extent.width, image.backing.extent.height},
+	                 PresentationFormat(image.info.pixel_format));
 	frame->CopyFrom(buffer, image);
 	return *frame;
 }
