@@ -837,11 +837,12 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 
 void GameController::GetTriggerEffectState(int32_t* state) {
 	Common::LockGuard lock(m_mutex);
-	const int axes[2] = {static_cast<int>(Axis::TriggerLeft), static_cast<int>(Axis::TriggerRight)};
+	const int axes[2] = {static_cast<int>(Controller::Axis::TriggerLeft),
+	                     static_cast<int>(Controller::Axis::TriggerRight)};
 	for (int i = 0; i < 2; i++) {
 		state[i] = (m_state_effect.trigger_mask & (1u << i)) != 0
 		               ? TriggerEffectState(m_state_effect.command[i],
-		                                    TriggerTravel(m_state, static_cast<Axis>(axes[i])))
+		                                    TriggerTravel(m_state, static_cast<Controller::Axis>(axes[i])))
 		               : 0;
 	}
 	// The first changes, for reports from games whose trigger actions still do not react.
@@ -850,8 +851,8 @@ void GameController::GetTriggerEffectState(int32_t* state) {
 	if (reports < 32 && (state[0] != last[0] || state[1] != last[1])) {
 		std::fprintf(stderr, "Pad: trigger state %d,%d (modes %u,%u, travel %d,%d)\n", state[0],
 		             state[1], m_state_effect.command[0].mode, m_state_effect.command[1].mode,
-		             TriggerTravel(m_state, Axis::TriggerLeft),
-		             TriggerTravel(m_state, Axis::TriggerRight));
+		             TriggerTravel(m_state, Controller::Axis::TriggerLeft),
+		             TriggerTravel(m_state, Controller::Axis::TriggerRight));
 		last = {state[0], state[1]};
 		reports++;
 	}
