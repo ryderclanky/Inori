@@ -787,6 +787,34 @@ void AnnotateFramePointerRedZone(DecodedFunction& function) {
 		}
 		function.uses_red_zone |= decoded.has_red_zone_operand;
 	}
+
+	// A join, an unvisited jump-table target, or an indexed RBP operand never
+	// receives a proven RSP-relative range. Protect the whole function instead
+	// of guessing; RSP-relative spills stay where they are.
+	bool unproven_frame_access = false;
+	for (size_t index = 0; index < instructions.size() && !unproven_frame_access; ++index) {
+		const auto& decoded     = *instructions[index];
+		const bool  frame_known = visited[index] != 0 &&
+		                         state_in[index].rsp_from_entry.has_value() &&
+		                         state_in[index].rbp_from_entry.has_value();
+		for (u8 op_index = 0; op_index < decoded.instruction.operand_count_visible; ++op_index) {
+			const auto& operand = decoded.operands[op_index];
+			if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+			    !IsFramePointerRegister(operand.mem.base) ||
+			    decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA) {
+				continue;
+			}
+			const bool proven = frame_known && operand.mem.index == ZYDIS_REGISTER_NONE;
+			if (!proven) {
+				unproven_frame_access = true;
+				break;
+			}
+		}
+	}
+	if (unproven_frame_access) {
+		function.uses_red_zone                           = true;
+		function.requires_conservative_red_zone_tracking = true;
+	}
 }
 
 void AnalyzeRedZoneLiveness(DecodedFunction& function) {

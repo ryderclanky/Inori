@@ -1554,17 +1554,17 @@ const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32
 		return nullptr;
 	}
 
-	if (af != 2 && af != 28) {
+	const int host_family = ConvertFamily(af);
+	if (host_family < 0) {
 		return nullptr;
 	}
 
 #if defined(_WIN32)
-	const int win_af = (af == 28 ? AF_INET6 : AF_INET);
-	if (::InetNtopA(win_af, const_cast<void*>(src), dst, size) == nullptr) {
+	if (::InetNtopA(host_family, const_cast<void*>(src), dst, size) == nullptr) {
 		return nullptr;
 	}
 #else
-	if (::inet_ntop(af, src, dst, size) == nullptr) {
+	if (::inet_ntop(host_family, src, dst, size) == nullptr) {
 		return nullptr;
 	}
 #endif
@@ -1607,7 +1607,7 @@ int KYTY_SYSV_ABI NetGetSockInfo(int s, void* info, int n, int flags) {
 	     "\t flags = %d\n",
 	     s, reinterpret_cast<uint64_t>(info), n, flags);
 
-	return OK;
+	return NET_ERROR_ENOTSUP;
 }
 
 int KYTY_SYSV_ABI EpollCreate(const char* name, int flags) {
@@ -2579,11 +2579,6 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		}
 		NativeSocket                    socket = INVALID_NATIVE_SOCKET;
 		std::shared_ptr<SocketTransport> transport;
-#if !defined(_WIN32)
-		if (fd < 3) {
-			socket = fd;
-		} else
-#endif
 		if (!GetSocketBackend(fd, &socket, nullptr, &transport)) {
 			return -1;
 		}
@@ -2651,17 +2646,21 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	GuestFdZero(exceptfds, nfds);
 	result = 0;
 	for (const auto& [fd, socket]: descriptors) {
+		bool ready = false;
 		if (FD_ISSET(socket, &host_read)) {
 			GuestFdSet(readfds, fd);
-			result++;
+			ready = true;
 		}
 		if (FD_ISSET(socket, &host_write)) {
 			GuestFdSet(writefds, fd);
-			result++;
+			ready = true;
 		}
 		if (FD_ISSET(socket, &host_except)) {
 			GuestFdSet(exceptfds, fd);
-			result++;
+			ready = true;
+		}
+		if (ready) {
+			++result;
 		}
 	}
 	return result;
@@ -3131,6 +3130,15 @@ int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int max
 
 	if (eh == nullptr || maxevents < 0 || (maxevents > 0 && nbev == nullptr)) {
 		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	if (eh->request_id.IsValid()) {
+		int send_result = HTTP_ERROR_BEFORE_SEND;
+		if (g_net->HttpGetRequestResponse(eh->request_id, &send_result, nullptr, nullptr, nullptr,
+		                                  nullptr) &&
+		    send_result < 0 && send_result != HTTP_ERROR_BEFORE_SEND) {
+			return send_result;
+		}
 	}
 
 	return 0;
@@ -3994,10 +4002,10 @@ int KYTY_SYSV_ABI NpSetContentRestriction(const NpContentRestriction* restrictio
 	return OK;
 }
 
-int KYTY_SYSV_ABI NpRegisterStateCallback(void* /*callback*/, void* /*userdata*/) {
+int KYTY_SYSV_ABI NpRegisterStateCallback(void* callback, void* userdata) {
 	PRINT_NAME();
 
-	return OK;
+	return NpRegisterStateCallbackA(reinterpret_cast<NpStateCallbackA>(callback), userdata);
 }
 
 int KYTY_SYSV_ABI NpUnregisterStateCallback() {

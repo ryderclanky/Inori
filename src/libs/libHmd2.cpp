@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/tile.h"
+#include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -11,7 +12,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <mutex>
 #include <new>
 
@@ -87,6 +87,44 @@ static_assert(offsetof(SceHmd2ReprojectionInitializeParam, pSeeThroughBuff) == 4
 static_assert(offsetof(SceHmd2ReprojectionInitializeParam, reprojectionTiming) == 48);
 static_assert(offsetof(SceHmd2ReprojectionInitializeParam, reserved) == 52);
 
+struct SceFVector3 {
+	float x;
+	float y;
+	float z;
+};
+
+// SDK gaze result. SceFVector3 is 12 bytes; the trailing flags pad the struct to 40.
+struct SceHmd2GazeResult {
+	SceFVector3 gazeOrigin;
+	SceFVector3 gazeDirection;
+	float       leftPupilDiameter;
+	float       rightPupilDiameter;
+	bool        leftBlink;
+	bool        rightBlink;
+	uint8_t     reserve0[2];
+	bool        isValid;
+	uint8_t     reserve1[3];
+};
+
+// One combined gaze point for the foveated region, not the full gaze ray.
+struct SceHmd2GazeResultForFoveatedRendering {
+	float   x;
+	float   y;
+	bool    isValid;
+	uint8_t reserve[3];
+};
+
+static_assert(sizeof(SceFVector3) == 12);
+static_assert(alignof(SceFVector3) == 4);
+static_assert(sizeof(SceHmd2GazeResult) == 40);
+static_assert(alignof(SceHmd2GazeResult) == 4);
+static_assert(offsetof(SceHmd2GazeResult, gazeDirection) == 12);
+static_assert(offsetof(SceHmd2GazeResult, leftPupilDiameter) == 24);
+static_assert(offsetof(SceHmd2GazeResult, leftBlink) == 32);
+static_assert(offsetof(SceHmd2GazeResult, isValid) == 36);
+static_assert(sizeof(SceHmd2GazeResultForFoveatedRendering) == 12);
+static_assert(alignof(SceHmd2GazeResultForFoveatedRendering) == 4);
+
 static std::atomic<bool> g_initialized = false;
 static std::mutex g_reprojection_mutex;
 static std::atomic<ReprojectionState*> g_reprojection_state {nullptr};
@@ -95,8 +133,16 @@ static constexpr int32_t HMD_HANDLE = 0x0F000000;
 static constexpr int32_t ERROR_ALREADY_OPENED = -1972240381; // 0x8a720003
 static constexpr int32_t ERROR_INVALID_HANDLE = -1972240375; // 0x8a720009
 
-static bool LooksLikeGuestPtr(const void* p) {
-	return reinterpret_cast<uintptr_t>(p) > 0x10000u;
+template <typename T>
+static int32_t FillMappedGuest(T* out) {
+	if (out == nullptr) {
+		return ERROR_PARAMETER_NULL;
+	}
+	if (!LibKernel::Memory::IsGuestRangeMapped(reinterpret_cast<uint64_t>(out), sizeof(T))) {
+		return OK;
+	}
+	*out = {};
+	return OK;
 }
 
 static void FillDeviceInformation(SceHmd2DeviceInformation* info) {
@@ -298,8 +344,11 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionGetStatus(uint32_t* status) {
 	if (GetReprojectionState() == nullptr) {
 		return ERROR_REPROJECTION_NOT_INITIALIZED;
 	}
-	// Only write when the arg looks like a guest pointer (not a small enum/flag).
-	if (LooksLikeGuestPtr(status)) {
+	if (status == nullptr) {
+		return ERROR_PARAMETER_NULL;
+	}
+	if (LibKernel::Memory::IsGuestRangeMapped(reinterpret_cast<uint64_t>(status),
+	                                          sizeof(*status))) {
 		*status = 0; // idle / ready
 	}
 	return OK;
@@ -363,20 +412,15 @@ static int32_t KYTY_SYSV_ABI Hmd2SetVibration(int32_t handle, const void* param)
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(void* result) {
+static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(SceHmd2GazeResult* result) {
 	PRINT_NAME();
-	if (LooksLikeGuestPtr(result)) {
-		std::memset(result, 0, 64);
-	}
-	return OK;
+	return FillMappedGuest(result);
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2GazeGetResultForFoveatedRendering(void* result) {
+static int32_t KYTY_SYSV_ABI
+Hmd2GazeGetResultForFoveatedRendering(SceHmd2GazeResultForFoveatedRendering* result) {
 	PRINT_NAME();
-	if (LooksLikeGuestPtr(result)) {
-		std::memset(result, 0, 64);
-	}
-	return OK;
+	return FillMappedGuest(result);
 }
 
 } // namespace Hmd2
