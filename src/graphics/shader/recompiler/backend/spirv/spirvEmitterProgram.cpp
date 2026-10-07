@@ -136,6 +136,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
+			if (!term.loop_header && term.true_block == term.false_block) {
+				// SPIRV-Cross discards every instruction after OpSelectionMerge followed by
+				// OpBranchConditional whose two targets are that merge. An unconditional branch
+				// is the same edge and keeps the rest of the shader. Jetsku/KytyPS5 766a37e1.
+				ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(true_block));
+				return;
+			}
 			const auto condition = ctx.Def(info.condition);
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
