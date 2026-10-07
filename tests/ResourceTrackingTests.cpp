@@ -3517,6 +3517,121 @@ void TestResourceLimitIsTransactional() {
         "resource-limit failure partially mutated typed resource state");
 }
 
+void TestWorkgroupImageTable() {
+  const auto make_table = [](uint32_t stride, bool workgroup) {
+    Fixture fixture(ShaderType::Compute);
+    const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto index = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(workgroup ? StageInputKind::WorkgroupId
+                                              : StageInputKind::GlobalInvocationId)),
+         Value(0u)});
+    Value offset = stride == 32u
+                       ? fixture.Emit(ValueOpcode::ShiftLeftLogical32, {index, Value(5u)})
+                       : fixture.Emit(ValueOpcode::IMul32, {index, Value(stride)});
+    std::array<Value, 8> words {};
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(
+          ValueOpcode::LoadAddressU32, {base, offset, Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x80 + word));
+    }
+    const auto image = fixture.Image(words, 0x114c);
+    MemoryInfo image_memory;
+    image_memory.kind = ResourceKind::Image;
+    image_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageRead, {image, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(image_memory, 0x114c));
+    return std::pair {std::move(fixture), image};
+  };
+
+  auto [fixture, image] = make_table(32u, true);
+  fixture.PlanAndTrack();
+  const auto source = fixture.program.info.images.at(0).source;
+  const auto &indirect = fixture.program.descriptor_sources.at(source).indirect_descriptor;
+  const auto *key = image.Instruction()->Arg(0).Resolve().TryInstruction();
+  Check(indirect && indirect->workgroup_axis == 0u && indirect->table_stride == 32u &&
+            indirect->table_offset == 0u && !indirect->selector &&
+            key != nullptr && key->GetOpcode() == ValueOpcode::GetBuiltin &&
+            !fixture.program.memory_info[0].planning_only,
+        "workgroup image table lost its dispatch key or flattened descriptor loads");
+
+  auto [wide, wide_image] = make_table(64u, true);
+  wide.PlanAndTrack();
+  const auto wide_source = wide.program.info.images.at(0).source;
+  const auto &wide_indirect = wide.program.descriptor_sources.at(wide_source).indirect_descriptor;
+  Check(wide_indirect && wide_indirect->workgroup_axis == 0u &&
+            wide_indirect->table_stride == 64u,
+        "workgroup image table rejected a non-32-byte record stride");
+  (void)wide_image;
+
+  CheckFatal([&] { make_table(32u, false).first.PlanAndTrack(); },
+             "not a valid runtime value",
+             "a global invocation index was accepted as a workgroup image table");
+
+  LinearTestMemory memory;
+  constexpr uint64_t table = 0x1000u;
+  std::array<std::array<uint32_t, 8>, 2> descriptors {};
+  for (uint32_t key = 0; key < descriptors.size(); ++key) {
+    descriptors[key] = {0x100u + key,
+                        static_cast<uint32_t>(
+                            Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                            << 20u,
+                        0u,
+                        Libs::Graphics::DstSel(4, 5, 6, 7) |
+                            (static_cast<uint32_t>(
+                                 Libs::Graphics::Prospero::ImageType::kColor2D)
+                             << 28u),
+                        0u, 0u, 0u, 0u};
+    std::copy(descriptors[key].begin(), descriptors[key].end(),
+              memory.words.begin() + (table - memory.base) / 4u + key * 8u);
+  }
+  std::array<uint32_t, 2> user_data {static_cast<uint32_t>(table), 0u};
+  std::array<uint32_t, 3> workgroups {2u, 1u, 1u};
+  SrtRuntime runtime {.user_data = user_data,
+                      .userdata = &memory,
+                      .read_specialization_memory = ReadLinearTestMemory,
+                      .workgroup_counts = workgroups};
+  const auto plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u &&
+            snapshot.images[0].dwords == descriptors[0] &&
+            snapshot.images[1].dwords == descriptors[1] &&
+            specialization.images[0].indirect_search_iterations != 0u,
+        "workgroup bounds did not materialize one image descriptor per group");
+}
+
+void TestUnboundGpuImageDescriptor() {
+  Fixture fixture(ShaderType::Compute);
+  // LaneId is a GPU value with no host equivalent. A uniform buffer load is now a
+  // runtime value and must not take this path.
+  const auto lane = fixture.Emit(ValueOpcode::LaneId, {});
+  const auto image = fixture.Image(
+      {lane, Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)},
+      0x114c);
+  MemoryInfo image_memory;
+  image_memory.kind = ResourceKind::Image;
+  image_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageRead, {image, fixture.ImageAddress(), Value(true)},
+               fixture.AddMemory(image_memory, 0x114c));
+  fixture.PlanAndTrack();
+  const auto source = fixture.program.info.images.at(0).source;
+  const auto &descriptor = fixture.program.descriptor_sources.at(source);
+  Check(fixture.program.resource_tracking_complete && !descriptor.indirect_descriptor &&
+            descriptor.dword_count == 8u,
+        "GPU image descriptor was not retained as an unbound image");
+  for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+    const auto value = descriptor.dwords[word].Resolve();
+    Check(value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == 0u,
+          "unbound image kept a GPU descriptor dword");
+  }
+}
+
 void TestMalformedMemoryKindsRejected() {
   {
     Fixture fixture;
@@ -3575,6 +3690,8 @@ int main() {
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("workgroup image table", TestWorkgroupImageTable);
+    Run("unbound GPU image descriptor", TestUnboundGpuImageDescriptor);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
