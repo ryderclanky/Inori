@@ -89,7 +89,8 @@ static void PrintUsage() {
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
-	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --playgo-hack                       Accepted for compatibility. A missing PlayGo\n"
+	         "                                      manifest already uses the local-install fallback.\n");
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
 	    "                                      Default: false.\n");
