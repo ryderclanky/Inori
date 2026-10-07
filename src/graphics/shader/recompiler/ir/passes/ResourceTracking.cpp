@@ -6,6 +6,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <fmt/format.h>
 #include <map>
 #include <optional>
@@ -18,6 +21,39 @@ namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
+
+// These opcodes are the host-proven descriptor families. A failure there is a bad proof and must
+// stay fatal. Other U32 producers are GPU values with no host equivalent.
+bool HostEvaluableImageDword(Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return true;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return true;
+	}
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::Phi:
+		case ValueOpcode::LoadAddressU32:
+		case ValueOpcode::ReadConstBuffer:
+		case ValueOpcode::ReadConst:
+		case ValueOpcode::GetUserData:
+		case ValueOpcode::GetSrtResource:
+		case ValueOpcode::GetShaderBase:
+		// Lane reads, selects, and builtins are incomplete descriptor proofs. Those stay fatal.
+		case ValueOpcode::ReadLane:
+		case ValueOpcode::ReadFirstLane:
+		case ValueOpcode::SelectU32:
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x3:
+		case ValueOpcode::CompositeExtractU32x4:
+		case ValueOpcode::GetAttribute:
+		case ValueOpcode::GetBuiltin:
+		case ValueOpcode::FindILsb32: return true;
+		default: return false;
+	}
+}
 
 uint32_t PossibleU32Bits(Value value) {
 	value = value.Resolve();
@@ -2097,6 +2133,26 @@ private:
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
+			}
+			// Scalar-read and phi descriptors stay fatal: those are proof failures, not missing
+			// bindings. Any other U32 image dword is a GPU value this host cannot evaluate.
+			// Binding a null image lets the shader compile; it does not reproduce the guest texel.
+			if (expected == ValueOpcode::GetImageResource &&
+			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
+			                [](Value word) { return word.Resolve().GetType() == Type::U32; }) &&
+			    !HostEvaluableImageDword(descriptor.dwords[bad_dword])) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+					std::fprintf(stderr,
+					             "shader resource tracking: hash=0x%016" PRIx64
+					             " stage=%s pc=0x%08x GetImageResource dword %u is not a "
+					             "host-evaluable runtime value; binding a null image\n",
+					             m_program.shader_hash, StageName(m_program.stage), pc, bad_dword);
+				}
+				descriptor.dword_count = width;
+				descriptor.dwords.fill(Value(0u));
+				source = InternSource(descriptor);
+				return true;
 			}
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));
