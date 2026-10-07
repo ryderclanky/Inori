@@ -1,7 +1,6 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
@@ -24,11 +23,22 @@ static constexpr int8_t   PLAYGO_LOCUS_LOCAL_FAST       = 3;
 static constexpr int32_t  PLAYGO_INSTALL_SPEED_FULL     = 2;
 static constexpr int32_t  PLAYGO_OPTIONAL_TYPE_LANGUAGE = 0;
 static constexpr int32_t  PLAYGO_OPTIONAL_TYPE_SCENARIO = 1;
-static constexpr uint32_t PLAYGO_DEFAULT_CHUNKS_NUM     = 1000;
+// A file dump may omit playgo-chunk.dat. The dumped PlayGo stub then enumerates
+// chunk ids 0..999 and treats them as a local install. Sonic Superstars
+// (PPSA06888) waits on "Downloading data" unless that enumeration succeeds.
+static constexpr uint32_t PLAYGO_FALLBACK_CHUNKS        = 1000;
 static constexpr uint64_t PLAYGO_LANGUAGE_MASK_ALL      = 0xffffffffffffffffull;
 static constexpr uint64_t PLAYGO_SCENARIO_MASK_ALL      = 0x1full;
 
-static uint32_t g_chunks_num = 0;
+static uint32_t g_chunks_num        = 0;
+static bool     g_manifest_missing  = false;
+static bool     g_chunks_loaded     = false;
+
+static void reset_chunk_cache() {
+	g_chunks_num       = 0;
+	g_manifest_missing = false;
+	g_chunks_loaded    = false;
+}
 
 struct PlayGoInitParams {
 	const void* buf_addr;
@@ -54,11 +64,28 @@ union PlayGoOptionalChunk {
 };
 
 static bool ensure_chunks_loaded() {
-	return g_chunks_num != 0 || Loader::SystemContentGetChunksNum(&g_chunks_num);
+	if (!g_chunks_loaded) {
+		g_manifest_missing = !Loader::SystemContentGetChunksNum(&g_chunks_num);
+		if (g_manifest_missing) {
+			g_chunks_num = PLAYGO_FALLBACK_CHUNKS;
+			LOGF("PlayGo: manifest unavailable; local-install fallback enumerates %u chunks\n",
+			     g_chunks_num);
+		}
+		g_chunks_loaded = true;
+	}
+	return g_chunks_num != 0;
 }
 
 static bool is_valid_chunk(uint16_t chunk_id) {
-	return ensure_chunks_loaded() && chunk_id < g_chunks_num;
+	if (!ensure_chunks_loaded()) {
+		return false;
+	}
+	// No manifest: the caller may ask for any id. Report it installed rather than
+	// failing the chunk as not downloaded. An empty manifest still has bounds.
+	if (g_manifest_missing) {
+		return true;
+	}
+	return chunk_id < g_chunks_num;
 }
 
 static bool is_valid_locus(int8_t locus) {
@@ -98,10 +125,7 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     "\t reserved = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
-	if (Config::PlayGoHackEnabled() && !ensure_chunks_loaded()) {
-		g_chunks_num = PLAYGO_DEFAULT_CHUNKS_NUM;
-		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", g_chunks_num);
-	}
+	reset_chunk_cache();
 
 	return OK;
 }
@@ -109,6 +133,7 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 int KYTY_SYSV_ABI PlayGoTerminate() {
 	PRINT_NAME();
 
+	reset_chunk_cache();
 	return OK;
 }
 
@@ -121,11 +146,9 @@ int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 	if (param != nullptr) {
 		return PLAYGO_ERROR_INVALID_ARGUMENT;
 	}
-	if (!ensure_chunks_loaded()) {
-		return PLAYGO_ERROR_NOT_SUPPORT_PLAYGO;
-	}
 
 	*out_handle = PLAYGO_HANDLE;
+	ensure_chunks_loaded();
 
 	return OK;
 }
@@ -221,10 +244,17 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 	if (out_entries == nullptr) {
 		return PLAYGO_ERROR_BAD_POINTER;
 	}
-	if (number_of_entries != 0 && out_chunk_id_list == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
-	}
 	ensure_chunks_loaded();
+
+	// Two-pass enumeration: a null list asks for the total, independent of capacity.
+	// Sonic Superstars stalls on the download gate when this pass returns zero.
+	if (out_chunk_id_list == nullptr) {
+		*out_entries = g_chunks_num;
+		return OK;
+	}
+	if (number_of_entries == 0) {
+		return PLAYGO_ERROR_BAD_SIZE;
+	}
 
 	const uint32_t entries = std::min(number_of_entries, g_chunks_num);
 	for (uint32_t i = 0; i < entries; i++) {
