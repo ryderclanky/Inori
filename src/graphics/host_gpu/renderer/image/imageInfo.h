@@ -342,9 +342,13 @@ struct VideoOutFormatPolicy {
 
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
 
-inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {{
+inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
+    // Not a scanout id. Hmd2 eye textures are often unorm; the flat mirror presents them
+    // through the same path as video-out buffers.
+    {0x8000000022000001ull,
+     {vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm, 4, false}},
     {0x8000000000000000ull,
      {vk::Format::eB8G8R8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8100000022000000ull,

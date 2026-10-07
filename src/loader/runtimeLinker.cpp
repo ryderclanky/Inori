@@ -1324,6 +1324,8 @@ void RuntimeLinker::Clear() {
 	m_symbols.reset();
 }
 
+static bool IsPlainUnityPluginExport(const std::string& name);
+
 void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* program,
                             SymbolRecord* out_info, bool* bind_self) {
 	KYTY_PROFILER_FUNCTION();
@@ -1421,6 +1423,28 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			EXIT("l == nullptr || m == nullptr");
+		}
+	} else if (!name.empty() && name.find('#') == std::string::npos &&
+	           IsPlainUnityPluginExport(name)) {
+		bool found = false;
+		for (auto* loaded: m_programs) {
+			if (loaded == nullptr || loaded->export_symbols == nullptr) {
+				continue;
+			}
+			if (const auto* rec = loaded->export_symbols->FindByName(name, type); rec != nullptr) {
+				*out_info = *rec;
+				if (bind_self != nullptr) {
+					*bind_self = (loaded == program);
+				}
+				found = true;
+				LOGF("Unity plugin import %s -> %s\n", name.c_str(), out_info->name.c_str());
+				break;
+			}
+		}
+		if (!found) {
+			out_info->vaddr    = 0;
+			out_info->name     = name;
+			out_info->dbg_name = "";
 		}
 	} else {
 		out_info->vaddr    = 0;
@@ -2061,6 +2085,10 @@ const LibraryId* RuntimeLinker::FindLibrary(const Program& program, const std::s
 	return nullptr;
 }
 
+static bool IsPlainUnityPluginExport(const std::string& name) {
+	return name.starts_with("Unity");
+}
+
 void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2109,6 +2137,30 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 					}
 					symbols->Add(sr, (is_export ? sym->st_value + program->base_vaddr : 0));
 				}
+			} else if (is_export && ids.size() == 1 && !id.empty() &&
+			           IsPlainUnityPluginExport(id) && (bind == STB_GLOBAL || bind == STB_WEAK) &&
+			           (type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE) &&
+			           sym->st_value != 0) {
+				// psvr2.prx exports UnitySetGraphicsDevice / UnityRenderingExt* as plain C
+				// names. NID#lib#module parsing skips them, so sceKernelDlsym never finds them
+				// and the Unity graphics hooks stay unwired.
+				SymbolResolve sr {};
+				sr.name                 = id;
+				sr.library              = "UnityPlugin";
+				sr.library_version      = 1;
+				sr.module               = "UnityPlugin";
+				sr.module_version_major = 1;
+				sr.module_version_minor = 0;
+				switch (type) {
+					case STT_NOTYPE: sr.type = SymbolType::NoType; break;
+					case STT_FUNC: sr.type = SymbolType::Func; break;
+					case STT_OBJECT: sr.type = SymbolType::Object; break;
+					default: sr.type = SymbolType::Unknown; break;
+				}
+				const auto vaddr = sym->st_value + program->base_vaddr;
+				symbols->Add(sr, vaddr);
+				LOGF("Unity plugin export %s -> 0x%016" PRIx64 " (%s)\n", id.c_str(), vaddr,
+				     Common::PathToString(program->file_name).c_str());
 			}
 		}
 	};
